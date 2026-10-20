@@ -11,6 +11,10 @@
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
+"repository": {
+    "type": "git",
+    "url": "git+https://github.com/wulw-1212/dsh-credit-float.git"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
