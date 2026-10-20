@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>积分</title>
+<style>
+  /* Light is the default palette; the dark palette below is applied both by the
+     OS preference (prefers-color-scheme) and by the explicit data-theme attribute
+     the main process sets from the DSH Appearance setting. */
+  :root {
+    --bg: #ffffff;
+    --bg-solid: #ffffff;
+    --fg: #1f2328;
+    --border: rgba(0, 0, 0, 0.14);
+    --border-strong: rgba(0, 0, 0, 0.28);
+    --muted: rgba(31, 35, 40, 0.55);
+    --divider: rgba(0, 0, 0, 0.08);
+    --hover: rgba(0, 0, 0, 0.06);
+    --shadow: 0 14px 44px rgba(0, 0, 0, 0.18);
+    --shadow-cap: 0 6px 24px rgba(0, 0, 0, 0.14);
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --bad: #cf222e;
+    --idle: #6e7781;
+    --hint: #b35900;
+    --active-bg: rgba(26, 127, 55, 0.1);
+    --badge-bg: #1a7f37;
+    --badge-fg: #ffffff;
+  }
+  :root[data-theme="dark"] {
+    --bg: #1f1f22;
+    --bg-solid: #1f1f22;
+    --fg: #ffffff;
+    --border: rgba(255, 255, 255, 0.22);
+    --border-strong: rgba(255, 255, 255, 0.4);
+    --muted: rgba(255, 255, 255, 0.6);
+    --divider: rgba(255, 255, 255, 0.1);
+    --hover: rgba(255, 255, 255, 0.14);
+    --shadow: 0 14px 44px rgba(0, 0, 0, 0.55);
+    --shadow-cap: 0 6px 24px rgba(0, 0, 0, 0.45);
+    --ok: #7ee787;
+    --warn: #e3b341;
+    --bad: #f85149;
+    --idle: #8b949e;
+    --hint: #ffb4a8;
+    --active-bg: rgba(126, 231, 135, 0.14);
+    --badge-bg: #238636;
+    --badge-fg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1f1f22;
+      --bg-solid: #1f1f22;
+      --fg: #ffffff;
+      --border: rgba(255, 255, 255, 0.22);
+      --border-strong: rgba(255, 255, 255, 0.4);
+      --muted: rgba(255, 255, 255, 0.6);
+      --divider: rgba(255, 255, 255, 0.1);
+      --hover: rgba(255, 255, 255, 0.14);
+      --shadow: 0 14px 44px rgba(0, 0, 0, 0.55);
+      --shadow-cap: 0 6px 24px rgba(0, 0, 0, 0.45);
+      --ok: #7ee787;
+      --warn: #e3b341;
+      --bad: #f85149;
+      --idle: #8b949e;
+      --hint: #ffb4a8;
+      --active-bg: rgba(126, 231, 135, 0.14);
+      --badge-bg: #238636;
+      --badge-fg: #ffffff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: transparent;
+    font: 600 13px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: var(--fg); -webkit-user-select: none; user-select: none;
+    overflow: hidden; cursor: grab;
+  }
+  body.dragging { cursor: grabbing; }
+  #cap {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 7px 12px; border-radius: 999px;
+    background: var(--bg-solid); border: 1px solid var(--border);
+    box-shadow: var(--shadow-cap); white-space: nowrap;
+  }
+  #cap.hidden { display: none; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+  .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+  .dot.idle { background: var(--idle); }
+
+  #panel {
+    width: 272px; max-height: 560px; overflow: auto; border-radius: 14px;
+    background: var(--bg-solid); border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+  }
+  #panel.hidden { display: none; }
+  .head {
+    position: sticky; top: 0; display: flex; align-items: center;
+    justify-content: space-between; gap: 8px; padding: 10px 12px;
+    background: var(--bg-solid); border-bottom: 1px solid var(--divider);
+    font-weight: 700; font-size: 13px;
+  }
+  .actions { display: flex; gap: 5px; flex: none; }
+  button {
+    border: 1px solid var(--border); background: transparent; color: inherit;
+    border-radius: 6px; padding: 1px 7px; font: inherit; font-size: 12px;
+    line-height: 1.6; cursor: pointer;
+  }
+  button:hover { background: var(--hover); }
+  button[disabled] { opacity: 0.5; cursor: default; }
+  .hint { padding: 4px 12px 8px; font-size: 11px; color: var(--hint); line-height: 1.5; font-weight: 500; }
+  .body { padding: 4px 12px 8px; }
+  .row {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px; padding: 5px 0; border-top: 1px solid var(--divider);
+  }
+  .row:first-child { border-top: none; }
+  /* The provider the composer is using right now. */
+  .row.active { background: var(--active-bg); border-radius: 6px; padding-left: 6px; padding-right: 6px; margin: 0 -6px; }
+  .row.active .name { font-weight: 700; }
+  .badge {
+    display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px;
+    font-size: 9px; font-weight: 700; line-height: 15px; vertical-align: 1px;
+    color: var(--badge-fg); background: var(--badge-bg);
+  }
+  .name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .meta { display: flex; flex-direction: column; align-items: flex-end; flex: none; max-width: 132px; }
+  .val { font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; color: var(--ok); }
+  .val.muted { color: var(--muted); font-weight: 600; }
+  .note {
+    font-size: 10px; color: var(--bad); text-align: right; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 132px; font-weight: 500;
+  }
+  .foot { padding: 7px 12px 10px; font-size: 10px; color: var(--muted); text-align: right; }
+</style>
+</head>
+<body>
+  <div id="cap"><span class="dot idle"></span><span id="capText">积分</span><span id="capBadge" class="badge" style="display:none"></span></div>
+  <div id="panel" class="hidden">
+    <div class="head">
+      <span>模型积分</span>
+      <div class="actions">
+        <button id="refresh" title="立即刷新">刷新</button>
+        <button id="collapse" title="收起">×</button>
+      </div>
+    </div>
+    <div class="hint" id="hint" style="display:none"></div>
+    <div class="body" id="body"></div>
+    <div class="foot" id="foot">—</div>
+  </div>
+
+<script>
+  const cap = document.getElementById('cap')
+  const capText = document.getElementById('capText')
+  const capBadge = document.getElementById('capBadge')
+  const dot = cap.querySelector('.dot')
+  const panel = document.getElementById('panel')
+  const body = document.getElementById('body')
+  const foot = document.getElementById('foot')
+  const hint = document.getElementById('hint')
+  const collapse = document.getElementById('collapse')
+  const refresh = document.getElementById('refresh')
+
+  let expanded = false
+  let last = null
+  let refreshing = false
+
+  /**
+   * Apply the palette. `system` is resolved by the main process (it asks
+   * electron.nativeTheme), so the renderer only ever receives light or dark.
+   */
+  function applyTheme(payload) {
+    const theme = payload?.theme === 'dark' ? 'dark' : 'light'
+    document.documentElement.dataset.theme = theme
+    document.documentElement.dataset.themePreference = payload?.preference ?? 'system'
+  }
+
+  if (window.dcfDesktop?.initialTheme) applyTheme(window.dcfDesktop.initialTheme)
+  window.dcfDesktop?.onTheme(applyTheme)
+
+  function formatHeadline(rows) {
+    const known = rows.filter(r => r.ok && r.id !== 'cline' && r.id !== 'zcode' && r.id !== 'gemini')
+    const total = known.reduce((sum, row) => {
+      const value = Number(String(row.value).replace(/[^\d.-]/g, ''))
+      return Number.isFinite(value) ? sum + value : sum
+    }, 0)
+    return total > 0 ? total.toLocaleString('zh-CN') + ' 积分' : '积分'
+  }
+
+  function report() {
+    const target = expanded ? panel : cap
+    const rect = target.getBoundingClientRect()
+    window.dcfDesktop?.resize({
+      width: Math.ceil(rect.width) + 4,
+      height: Math.ceil(rect.height) + 4,
+    })
+  }
+
+  function render(state) {
+    if (!state) return
+    last = state
+    // A push means the page finished a collection round (manual or periodic).
+    if (refreshing) setRefreshing(false)
+    const rows = Array.isArray(state.rows) ? state.rows : []
+    const okCount = rows.filter(r => r.ok).length
+    const badCount = rows.filter(r => !r.ok && r.note).length
+
+    dot.className = 'dot ' + (okCount === 0 ? 'idle' : badCount > 0 ? 'warn' : '')
+    capText.textContent = state.headline || (okCount === 0 ? '积分' : formatHeadline(rows))
+
+    // The active provider rides along in the collapsed capsule too: it is the
+    // one thing worth seeing without opening the panel.
+    const activeRow = rows.find(row => row.active === true || row.id === state.activeProvider)
+    capBadge.textContent = activeRow ? activeRow.label : ''
+    capBadge.style.display = activeRow ? 'inline-block' : 'none'
+    cap.title = activeRow
+      ? '当前模型：' + (state.activeModel || activeRow.label)
+      : '点击展开各渠道剩余积分'
+
+    hint.style.display = state.fatal ? 'block' : 'none'
+    hint.textContent = state.fatal || ''
+
+    body.replaceChildren(...rows.map(row => {
+      const isActive = row.active === true || row.id === state.activeProvider
+      const wrap = document.createElement('div')
+      wrap.className = 'row' + (isActive ? ' active' : '')
+      if (isActive) wrap.title = '当前对话正在使用' + (state.activeModel ? '：' + state.activeModel : '')
+      const name = document.createElement('span')
+      name.className = 'name'
+      name.textContent = row.label
+      if (row.note) name.title = row.note
+      if (isActive) {
+        const badge = document.createElement('span')
+        badge.className = 'badge'
+        badge.textContent = '当前'
+        name.appendChild(badge)
+      }
+      const meta = document.createElement('span')
+      meta.className = 'meta'
+      const value = document.createElement('span')
+      value.className = 'val' + (row.ok ? '' : ' muted')
+      value.textContent = row.value
+      meta.appendChild(value)
+      if (row.note) {
+        const note = document.createElement('span')
+        note.className = 'note'
+        note.textContent = row.note
+        note.title = row.note
+        meta.appendChild(note)
+      }
+      wrap.append(name, meta)
+      return wrap
+    }))
+
+    foot.textContent = state.updatedAt
+      ? '更新于 ' + new Date(state.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+      : '—'
+
+    // Expanded/collapsed is owned by this window: the sender omits the field on a
+    // plain data refresh, so an open panel stays open.
+    if (state.expanded !== undefined && state.expanded !== null) {
+      setExpanded(state.expanded === true)
+    }
+    // Content changed ⇒ the natural size may have changed too.
+    requestAnimationFrame(report)
+  }
+
+  function setExpanded(next) {
+    expanded = next === true
+    cap.classList.toggle('hidden', expanded)
+    panel.classList.toggle('hidden', !expanded)
+    requestAnimationFrame(report)
+  }
+
+  function setRefreshing(value) {
+    refreshing = value === true
+    refresh.disabled = refreshing
+    refresh.textContent = refreshing ? '刷新中' : '刷新'
+  }
+
+  cap.addEventListener('click', () => {
+    setExpanded(true)
+  })
+  collapse.addEventListener('click', event => {
+    event.stopPropagation()
+    setExpanded(false)
+  })
+
+  // Refresh asks the page to re-collect now instead of waiting for the timer.
+  // The page answers by pushing a new state, which clears the busy state.
+  refresh.addEventListener('click', event => {
+    event.stopPropagation()
+    if (refreshing) return
+    setRefreshing(true)
+    window.dcfDesktop?.requestRefresh()
+    // Safety net: never leave the button stuck if the page is gone.
+    setTimeout(() => setRefreshing(false), 45_000)
+  })
+
+  // ── drag: hold anywhere on the capsule or the panel header ──────────────
+  let drag = null
+  window.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return
+    if (event.target.closest('button')) return
+    if (expanded && !event.target.closest('.head')) return
+    drag = { x: event.screenX, y: event.screenY }
+    document.body.classList.add('dragging')
+    window.dcfDesktop?.dragStart()
+  })
+  window.addEventListener('pointermove', event => {
+    if (!drag) return
+    window.dcfDesktop?.dragMove({ dx: event.screenX - drag.x, dy: event.screenY - drag.y })
+  })
+  window.addEventListener('pointerup', () => {
+    if (!drag) return
+    drag = null
+    document.body.classList.remove('dragging')
+    window.dcfDesktop?.dragEnd()
+  })
+
+  window.dcfDesktop?.onState(render)
+  window.addEventListener('resize', () => requestAnimationFrame(report))
+  requestAnimationFrame(report)
+
+  if (window.dcfDesktop?.initial) render(window.dcfDesktop.initial)
+</script>
+</body>
+</html>

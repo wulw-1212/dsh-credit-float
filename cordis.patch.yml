@@ -1,0 +1,6 @@
+# dsh-credit-float —— 把各渠道剩余积分飘在主界面。
+# Host: 无状态，只负责让这个 bundle 挂进配置树。
+# Client: shell.overlay 槽，读取 dsh-our-free-model 的 channel-pack RPC（usage.badge）。
+- insert:
+    - id: dsh-credit-float
+      name: 'dsh-credit-float'
