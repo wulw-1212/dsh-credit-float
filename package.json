@@ -13,7 +13,7 @@
   },
 "repository": {
     "type": "git",
-    "url": "git+https://github.com/wulw-1212/dsh-credit-float.git"
+    "url": "https://github.com/wulw-1212/dsh-credit-float.git"
   },
   "dsh": {
     "bundle": {
