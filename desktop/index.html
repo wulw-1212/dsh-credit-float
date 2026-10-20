@@ -103,6 +103,9 @@
     font-weight: 700; font-size: 13px;
   }
   .actions { display: flex; gap: 5px; flex: none; }
+  /* The header title is the panel's collapse target, so it reads as clickable. */
+  .title { cursor: pointer; }
+  .title:hover { color: var(--muted); }
   button {
     border: 1px solid var(--border); background: transparent; color: inherit;
     border-radius: 6px; padding: 1px 7px; font: inherit; font-size: 12px;
@@ -140,7 +143,7 @@
   <div id="cap"><span class="dot idle"></span><span id="capText">积分</span><span id="capBadge" class="badge" style="display:none"></span></div>
   <div id="panel" class="hidden">
     <div class="head">
-      <span>模型积分</span>
+      <span class="title" id="title" title="点击收起">模型积分</span>
       <div class="actions">
         <button id="refresh" title="立即刷新">刷新</button>
         <button id="collapse" title="收起">×</button>
@@ -161,6 +164,7 @@
   const foot = document.getElementById('foot')
   const hint = document.getElementById('hint')
   const collapse = document.getElementById('collapse')
+  const title = document.getElementById('title')
   const refresh = document.getElementById('refresh')
 
   let expanded = false
@@ -290,6 +294,13 @@
       return
     }
     setExpanded(true)
+  })
+  // The header title folds the panel back into the capsule. It shares the
+  // header's drag gesture, so `dragged` keeps a drag from also collapsing it.
+  title.addEventListener('click', event => {
+    event.stopPropagation()
+    if (dragged) return
+    setExpanded(false)
   })
   collapse.addEventListener('click', event => {
     event.stopPropagation()
