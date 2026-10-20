@@ -280,7 +280,15 @@
     refresh.textContent = refreshing ? '刷新中' : '刷新'
   }
 
-  cap.addEventListener('click', () => {
+  // A click only expands the capsule when the pointer stayed put: dragging the
+  // capsule ends with a `click` on the same element, which used to pop the panel
+  // open every time the user moved it. `dragged` is cleared on the next press,
+  // so a drag whose click never arrives cannot swallow a later real click.
+  cap.addEventListener('click', event => {
+    if (dragged) {
+      event.preventDefault()
+      return
+    }
     setExpanded(true)
   })
   collapse.addEventListener('click', event => {
@@ -300,25 +308,52 @@
   })
 
   // ── drag: hold anywhere on the capsule or the panel header ──────────────
+  // Moving the capsule must not expand it, so a gesture only becomes a drag
+  // after the pointer travels past a small threshold; anything shorter stays a
+  // plain click.
+  const DRAG_THRESHOLD = 4
   let drag = null
+  let dragging = false
+  let dragged = false
+
+  function endDrag() {
+    // A pending gesture (press without movement) must be dropped here too,
+    // otherwise the next hover would drag the capsule without a button held.
+    const wasDragging = dragging
+    drag = null
+    dragging = false
+    document.body.classList.remove('dragging')
+    if (wasDragging) window.dcfDesktop?.dragEnd()
+  }
+
   window.addEventListener('pointerdown', event => {
     if (event.button !== 0) return
+    // A press always abandons the previous gesture; otherwise a drag that ended
+    // outside the window could leave `dragging` stuck on.
+    endDrag()
     if (event.target.closest('button')) return
     if (expanded && !event.target.closest('.head')) return
     drag = { x: event.screenX, y: event.screenY }
-    document.body.classList.add('dragging')
-    window.dcfDesktop?.dragStart()
+    dragging = false
+    dragged = false
   })
   window.addEventListener('pointermove', event => {
     if (!drag) return
-    window.dcfDesktop?.dragMove({ dx: event.screenX - drag.x, dy: event.screenY - drag.y })
+    const dx = event.screenX - drag.x
+    const dy = event.screenY - drag.y
+    if (!dragging) {
+      if (Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return
+      dragging = true
+      dragged = true
+      document.body.classList.add('dragging')
+      // The window is still at its resting position, so this origin is exact.
+      window.dcfDesktop?.dragStart()
+    }
+    window.dcfDesktop?.dragMove({ dx, dy })
   })
-  window.addEventListener('pointerup', () => {
-    if (!drag) return
-    drag = null
-    document.body.classList.remove('dragging')
-    window.dcfDesktop?.dragEnd()
-  })
+  window.addEventListener('pointerup', endDrag)
+  window.addEventListener('pointercancel', endDrag)
+  window.addEventListener('blur', endDrag)
 
   window.dcfDesktop?.onState(render)
   window.addEventListener('resize', () => requestAnimationFrame(report))
