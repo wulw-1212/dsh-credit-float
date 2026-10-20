@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-credit-float — host half.
  *
  * Responsibilities:
@@ -53,7 +53,9 @@ function resolveElectron() {
 export function apply(ctx) {
   const electron = resolveElectron()
   const port = Number(process.env.DCF_PORT || DEFAULT_PORT)
-  const stateFile = join(dirname(here), '.dsh-credit-float-window.json')
+  // Kept inside this package folder so the saved position travels with the
+  // project instead of landing in whatever directory happens to contain it.
+  const stateFile = join(here, '.dsh-credit-float-window.json')
 
   // Publish the endpoint so the browser half can find it without duplicating
   // the port in two places.
