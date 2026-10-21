@@ -14,11 +14,17 @@
 ;(() => {
   const NS = 'dsh-credit-float'
 
+  /**
+   * The free channels `dsh-our-free-model` serves, one row per channel.
+   *
+   * This mirrors that plugin's own channel roster (`CHANNEL_PROVIDERS` in its
+   * `client.js`), because the two lists are read side by side: an id it does not
+   * serve makes `usage.badge` answer "不支持此渠道", leaving the capsule with a
+   * dead row and a count that disagrees with Our Free Model.
+   */
   const PROVIDERS = [
-    { id: 'lobsterai', label: 'LobsterAI', unit: 'credit' },
-    { id: 'workbuddy', label: 'WorkBuddy', unit: 'credit' },
-    { id: 'buddy', label: 'CodeBuddy', unit: 'credit' },
     { id: 'codearts', label: 'CodeArts', unit: 'credit' },
+    { id: 'lobsterai', label: 'LobsterAI', unit: 'credit' },
     { id: 'qoder', label: 'Qoder', unit: 'credit' },
     { id: 'qodercn', label: 'Qoder CN', unit: 'credit' },
     { id: 'trae', label: 'Trae', unit: 'credit' },
