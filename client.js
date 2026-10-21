@@ -208,6 +208,14 @@
         const collect = async () => {
           const next = {}
           let reachable = false
+
+          // The model can change without a single balance moving, and the periodic
+          // watcher is throttled while the page is in the background. A refresh
+          // therefore re-reads the composer's selection up front and publishes it
+          // before the slow RPC round, so the marker follows the refresh instead
+          // of waiting for the next watcher tick.
+          await syncSelection()
+
           // Sequential: channel-pack queries upstream once per account, and firing
           // 13 providers at the same time is exactly what trips rate limits.
           for (const provider of PROVIDERS) {
@@ -247,8 +255,10 @@
 
           const fatal = reachable ? null : 'channel-pack 不可达：dsh-our-free-model 未加载，或连接通道未就绪'
           const selection = currentSelection()
+          lastSelectionKey = selectionKeyOf(selection)
           lastPushed = next
-          await push(buildPayload(next, selection, fatal))
+          lastUpdatedAt = Date.now()
+          await push(buildPayload(next, selection, fatal, lastUpdatedAt))
         }
 
         let lastRefreshAsked = 0
@@ -257,9 +267,34 @@
         let pollTimer = null
         /** Last collected numbers, reused by the selection watcher. */
         let lastPushed = null
+        /** When those numbers were collected, reused by marker-only pushes. */
+        let lastUpdatedAt = 0
+        let lastSelectionKey = ''
+
+        const selectionKeyOf = selection => (selection ? `${selection.provider}/${selection.model}` : '')
+
+        /**
+         * Publish a changed model marker right away, without touching the numbers.
+         *
+         * Only the active row and the badge change, so the previous balances are
+         * reused and the panel does not flash empty while credits are re-read.
+         */
+        const syncSelection = async () => {
+          if (disposed) return
+          const selection = currentSelection()
+          const key = selectionKeyOf(selection)
+          if (key === lastSelectionKey) return
+          lastSelectionKey = key
+          if (lastPushed === null) return
+          try {
+            await push(buildPayload(lastPushed, selection, undefined, lastUpdatedAt))
+          } catch {
+            /* helper not up yet: the collection round will retry on its own */
+          }
+        }
 
         /** Shape the wire payload the desktop window consumes. */
-        const buildPayload = (next, selection, fatal) => {
+        const buildPayload = (next, selection, fatal, at) => {
           const creditSum = PROVIDERS.reduce((sum, provider) => {
             const row = next[provider.id]
             return provider.unit === 'credit' && row?.state === 'ok' ? sum + row.sum : sum
@@ -270,7 +305,7 @@
             // The desktop window owns its own expanded state; omitting the field
             // keeps an open panel open across refreshes.
             fatal,
-            updatedAt: Date.now(),
+            updatedAt: Number.isFinite(at) ? at : Date.now(),
             // Which provider the composer currently uses, so the window can mark it.
             activeProvider: selection?.provider ?? null,
             activeModel: selection?.model ?? null,
@@ -320,6 +355,9 @@
             if (stamp <= lastRefreshAsked) return
             lastRefreshAsked = stamp
           }
+          // A click must move the model marker even when a periodic round is
+          // already in flight and the numbers are therefore skipped.
+          await syncSelection()
           if (refreshing || disposed) return
           refreshing = true
           clearTimeout(timer)
@@ -390,23 +428,12 @@
          * The active model can change without any credit moving (the user just
          * picks another model), and a page reload restarts this half from scratch.
          * A light watcher keeps the marker honest in both cases without touching
-         * the network.
+         * the network — the same path a refresh takes, so both agree on when the
+         * marker moved.
          */
-        let lastSelectionKey = ''
         const watchSelection = () => {
           if (disposed) return
-          const selection = currentSelection()
-          const key = selection ? `${selection.provider}/${selection.model}` : ''
-          if (key !== lastSelectionKey) {
-            lastSelectionKey = key
-            // Only the marker and its rows change; reuse the last numbers so the
-            // panel does not flash empty while the credits are being re-read.
-            if (lastPushed !== null) {
-              void push(buildPayload(lastPushed, selection))
-            } else {
-              void tick()
-            }
-          }
+          void syncSelection()
         }
 
         // Give the helper a moment to bind its port before the first push.

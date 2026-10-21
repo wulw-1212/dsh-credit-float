@@ -1,6 +1,6 @@
 {
   "name": "dsh-credit-float",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
   "description": "完全脱离 DSH 窗口（页面内不再显示）。",
   "type": "module",
