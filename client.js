@@ -18,12 +18,15 @@
    * The free channels `dsh-our-free-model` serves, one row per channel.
    *
    * This mirrors that plugin's own channel roster (`CHANNEL_PROVIDERS` in its
-   * `client.js`), because the two lists are read side by side: an id it does not
-   * serve makes `usage.badge` answer "不支持此渠道", leaving the capsule with a
-   * dead row and a count that disagrees with Our Free Model.
+   * `client.js`). It is only a starting point: the roster drifts when Our Free
+   * Model drops or adds a channel, and a stale id here used to leave a dead row
+   * reading "不支持此渠道" in the capsule. `collect()` therefore demotes any
+   * provider the pack reports as unsupported (`state: 'unsupported'`), and
+   * `buildPayload()` drops such rows entirely — the capsule shows exactly the
+   * channels the pack actually serves, and the active-model badge disappears
+   * with a channel that is not one of them.
    */
   const PROVIDERS = [
-    { id: 'codearts', label: 'CodeArts', unit: 'credit' },
     { id: 'lobsterai', label: 'LobsterAI', unit: 'credit' },
     { id: 'qoder', label: 'Qoder', unit: 'credit' },
     { id: 'qodercn', label: 'Qoder CN', unit: 'credit' },
@@ -211,10 +214,15 @@
           return response.json()
         }
 
+        /**
+         * Providers the pack answered "不支持此渠道" for, remembered between
+         * rounds so the selection watcher also knows to hide their badge.
+         */
+        const unsupported = new Set()
+
         const collect = async () => {
           const next = {}
           let reachable = false
-
           // The model can change without a single balance moving, and the periodic
           // watcher is throttled while the page is in the background. A refresh
           // therefore re-reads the composer's selection up front and publishes it
@@ -229,6 +237,7 @@
             try {
               const value = await rpc('usage.badge', { provider: provider.id })
               reachable = true
+              unsupported.delete(provider.id)
               const accounts = Array.isArray(value?.accounts) ? value.accounts : []
               if (accounts.length === 0) {
                 next[provider.id] = { state: 'empty' }
@@ -254,6 +263,16 @@
                 : { state: 'ok', sum, counted, total: accounts.length, error: failure }
             } catch (error) {
               const message = String(error?.message ?? error)
+              // The pack answers "不支持此渠道。" / "unsupported provider: x" for
+              // an id it no longer serves. That is not an error row — it means the
+              // channel is gone, so remember it as unsupported and hide the row
+              // instead of showing a dead "—" forever (and hiding its badge too).
+              if (/不支持此渠道|unsupported provider/i.test(message)) {
+                unsupported.add(provider.id)
+                next[provider.id] = { state: 'unsupported' }
+                continue
+              }
+              unsupported.delete(provider.id)
               next[provider.id] = { state: 'error', error: message === 'no-connection' ? '未连接' : message }
             }
           }
@@ -301,21 +320,27 @@
 
         /** Shape the wire payload the desktop window consumes. */
         const buildPayload = (next, selection, fatal, at) => {
-          const creditSum = PROVIDERS.reduce((sum, provider) => {
+          // Channels the pack no longer serves are not dead rows to display — they
+          // leave the capsule entirely, so the headline, the list, and the active
+          // badge all agree with what Our Free Model actually offers.
+          const visible = PROVIDERS.filter(provider => next[provider.id]?.state !== 'unsupported')
+          const creditSum = visible.reduce((sum, provider) => {
             const row = next[provider.id]
             return provider.unit === 'credit' && row?.state === 'ok' ? sum + row.sum : sum
           }, 0)
-          const okCount = PROVIDERS.map(p => next[p.id]).filter(row => row?.state === 'ok').length
+          const okCount = visible.map(p => next[p.id]).filter(row => row?.state === 'ok').length
           return {
             headline: okCount === 0 ? '积分' : formatNumber(creditSum) + ' 积分',
             // The desktop window owns its own expanded state; omitting the field
             // keeps an open panel open across refreshes.
             fatal,
             updatedAt: Number.isFinite(at) ? at : Date.now(),
-            // Which provider the composer currently uses, so the window can mark it.
-            activeProvider: selection?.provider ?? null,
-            activeModel: selection?.model ?? null,
-            rows: PROVIDERS.map(provider => {
+            // Which provider the composer currently uses, so the window can mark
+            // it. A provider the pack dropped has no row to mark: publish a null
+            // marker so the capsule badge disappears with it.
+            activeProvider: selection && visible.some(p => p.id === selection.provider) ? selection.provider : null,
+            activeModel: selection && visible.some(p => p.id === selection.provider) ? selection.model : null,
+            rows: visible.map(provider => {
               const row = next[provider.id]
               const unit = UNIT_OF[provider.id] ?? 'credit'
               const active = selection?.provider === provider.id
