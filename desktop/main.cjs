@@ -355,7 +355,14 @@ function hostAlive() {
 app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler(() => false)
   server.on('error', error => {
-    console.error('[dcf-desktop] 端口占用，改为只显示已有窗口:', error.message)
+    if (error?.code === 'EADDRINUSE') {
+      // Another helper already owns the port and draws the capsule; a second
+      // window here would leave two capsules on the desktop. Quit instead.
+      console.warn('[dcf-desktop] 端口已被占用，已有胶囊在显示，本实例退出')
+      app.quit()
+      return
+    }
+    console.error('[dcf-desktop] 监听失败:', error.message)
   })
   server.listen(PORT, '127.0.0.1')
   createWindow()
