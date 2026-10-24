@@ -337,13 +337,13 @@
           if (activeProviderId && next[activeProviderId]?.state === 'ok') {
             const activeUnit = UNIT_OF[activeProviderId]
             if (activeUnit === 'credit') {
-              headlineCredit = next[activeProviderId].sum
+              headlineCredit = formatNumber(Math.round(next[activeProviderId].sum))
             } else if (activeUnit === 'usd') {
               headlineCredit = '$' + next[activeProviderId].sum.toFixed(2)
             } else if (activeUnit === 'token') {
-              headlineCredit = formatNumber(next[activeProviderId].sum) + ' tok'
+              headlineCredit = formatNumber(Math.round(next[activeProviderId].sum)) + ' tok'
             } else if (activeUnit === 'quota') {
-              headlineCredit = next[activeProviderId].sum
+              headlineCredit = Math.round(next[activeProviderId].sum)
             }
           }
           
