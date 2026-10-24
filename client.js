@@ -324,13 +324,34 @@
           // leave the capsule entirely, so the headline, the list, and the active
           // badge all agree with what Our Free Model actually offers.
           const visible = PROVIDERS.filter(provider => next[provider.id]?.state !== 'unsupported')
-          const creditSum = visible.reduce((sum, provider) => {
+          
+          // Calculate total for fallback when no active provider
+          const creditSumAll = visible.reduce((sum, provider) => {
             const row = next[provider.id]
             return provider.unit === 'credit' && row?.state === 'ok' ? sum + row.sum : sum
           }, 0)
+          
+          // Show only the currently active provider's balance in the headline
+          const activeProviderId = selection?.provider
+          let headlineCredit = null
+          if (activeProviderId && next[activeProviderId]?.state === 'ok') {
+            const activeUnit = UNIT_OF[activeProviderId]
+            if (activeUnit === 'credit') {
+              headlineCredit = next[activeProviderId].sum
+            } else if (activeUnit === 'usd') {
+              headlineCredit = '$' + next[activeProviderId].sum.toFixed(2)
+            } else if (activeUnit === 'token') {
+              headlineCredit = formatNumber(next[activeProviderId].sum) + ' tok'
+            } else if (activeUnit === 'quota') {
+              headlineCredit = next[activeProviderId].sum
+            }
+          }
+          
           const okCount = visible.map(p => next[p.id]).filter(row => row?.state === 'ok').length
           return {
-            headline: okCount === 0 ? '积分' : formatNumber(creditSum) + ' 积分',
+            headline: headlineCredit === null 
+              ? (okCount === 0 ? '积分' : formatNumber(creditSumAll) + ' 积分')
+              : String(headlineCredit),
             // The desktop window owns its own expanded state; omitting the field
             // keeps an open panel open across refreshes.
             fatal,
