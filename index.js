@@ -25,6 +25,10 @@ export const inject = ['connection']
 const HELPER_DIR = resolve(here, 'desktop')
 const HELPER_MAIN = join(HELPER_DIR, 'main.cjs')
 const DEFAULT_PORT = 18733
+// Electron can appear *after* this host booted (first-run download, or the user
+// installing it while DSH is open), so a missing binary is retried instead of
+// ending the plugin for the lifetime of the process.
+const DEFAULT_RESOLVE_RETRY_MS = 5000
 
 /** Resolve the Electron binary the same way dsh-pet does: $DSH_HOME/electron. */
 function resolveElectron() {
@@ -51,33 +55,73 @@ function resolveElectron() {
 }
 
 export function apply(ctx) {
-  const electron = resolveElectron()
   const port = Number(process.env.DCF_PORT || DEFAULT_PORT)
   // Kept inside this package folder so the saved position travels with the
   // project instead of landing in whatever directory happens to contain it.
   const stateFile = join(here, '.dsh-credit-float-window.json')
-
-  // Publish the endpoint so the browser half can find it without duplicating
-  // the port in two places.
-  try {
-    ctx.provide?.('creditFloatDesktop', { port, available: electron !== undefined })
-  } catch {
-    /* older hosts: no service slot, the client falls back to the default port */
-  }
-
-  if (electron === undefined) {
-    ctx.logger?.warn?.(
-      'dsh-credit-float: 未找到 Electron（$DSH_HOME/electron），桌面积分胶囊不可用；页面内胶囊照常工作。',
-    )
-    return
-  }
+  const retrySetting = Number(process.env.DCF_RESOLVE_RETRY_MS)
+  const resolveRetryMs = Number.isFinite(retrySetting) && retrySetting > 0 ? retrySetting : DEFAULT_RESOLVE_RETRY_MS
 
   let child
   let stopping = false
   let restarts = 0
+  let resolveTimer
+  let warnedMissingElectron = false
+
+  // One stable object, published immediately so the browser half can find the
+  // endpoint without duplicating the port in two places. `available` is mutated
+  // as the helper comes and goes: a late Electron install must become visible
+  // here too instead of being frozen at apply() time.
+  const service = { port, available: false }
+  try {
+    ctx.provide?.('creditFloatDesktop', service)
+  } catch {
+    /* older hosts: no service slot, the client falls back to the default port */
+  }
+
+  const warnMissingElectron = () => {
+    if (warnedMissingElectron) return
+    warnedMissingElectron = true
+    ctx.logger?.warn?.(
+      `dsh-credit-float: 未找到 Electron（$DSH_HOME/electron），桌面积分胶囊暂不可用；每 ${resolveRetryMs} ms 重试，页面内胶囊照常工作。`,
+    )
+  }
+
+  /** Re-arm the resolution attempt; never re-armed once the effect disposes. */
+  const retryResolve = () => {
+    if (stopping || resolveTimer !== undefined) return
+    resolveTimer = setTimeout(() => {
+      resolveTimer = undefined
+      launch()
+    }, resolveRetryMs)
+    // Polling for a binary must never keep the host process alive on its own.
+    resolveTimer.unref?.()
+  }
+
+  const scheduleRestart = reason => {
+    if (stopping) return
+    if (restarts >= 3) {
+      ctx.logger?.warn?.('dsh-credit-float: 桌面胶囊连续退出，已停止重启')
+      return
+    }
+    restarts += 1
+    const delay = 1500 * restarts
+    setTimeout(launch, delay).unref?.()
+    ctx.logger?.debug?.(`dsh-credit-float: 桌面胶囊退出（${reason}），${delay} ms 后重启`)
+  }
 
   const launch = () => {
     if (stopping) return
+    // A resolve tick can race a pending restart timer: one helper at a time.
+    if (child !== undefined) return
+
+    const electron = resolveElectron()
+    if (electron === undefined) {
+      warnMissingElectron()
+      retryResolve()
+      return
+    }
+
     try {
       mkdirSync(dirname(stateFile), { recursive: true })
     } catch {
@@ -92,43 +136,55 @@ export function apply(ctx) {
     // The helper must run as a real Electron app, not as bare Node.
     delete env.ELECTRON_RUN_AS_NODE
 
-    child = spawn(electron, [HELPER_MAIN], {
+    const proc = spawn(electron, [HELPER_MAIN], {
       cwd: HELPER_DIR,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
+    child = proc
 
-    child.stdout?.on?.('data', chunk => {
+    proc.stdout?.on?.('data', chunk => {
       const text = String(chunk).trim()
       if (text) ctx.logger?.debug?.(`[dcf-desktop] ${text}`)
     })
-    child.stderr?.on?.('data', chunk => {
+    proc.stderr?.on?.('data', chunk => {
       const text = String(chunk).trim()
       if (text) ctx.logger?.warn?.(`[dcf-desktop] ${text}`)
     })
-    child.on('error', error => {
-      ctx.logger?.warn?.(`dsh-credit-float: 桌面胶囊启动失败：${error.message}`)
-    })
-    child.on('exit', code => {
-      child = undefined
-      if (stopping) return
-      if (restarts >= 3) {
-        ctx.logger?.warn?.('dsh-credit-float: 桌面胶囊连续退出，已停止重启')
-        return
-      }
-      restarts += 1
-      setTimeout(launch, 1500 * restarts).unref?.()
-      ctx.logger?.debug?.(`dsh-credit-float: 桌面胶囊退出（code=${String(code)}），准备重启`)
-    })
 
-    ctx.logger?.info?.(`dsh-credit-float: 桌面胶囊已启动（127.0.0.1:${port}）`)
+    let settled = false
+    const onGone = reason => {
+      if (settled) return
+      settled = true
+      if (child === proc) child = undefined
+      service.available = false
+      scheduleRestart(reason)
+    }
+
+    proc.on('error', error => {
+      ctx.logger?.warn?.(`dsh-credit-float: 桌面胶囊启动失败：${error.message}`)
+      // A spawn failure (ENOENT) emits `error` and never `exit`; clear the slot
+      // so the restart path re-resolves Electron from scratch.
+      if (proc.pid === undefined) onGone(`error=${String(error.code ?? error.message)}`)
+    })
+    proc.on('exit', code => onGone(`code=${String(code)}`))
+
+    proc.once('spawn', () => {
+      service.available = true
+      ctx.logger?.info?.(`dsh-credit-float: 桌面胶囊已启动（127.0.0.1:${port}）`)
+    })
   }
 
   ctx.effect(() => {
     launch()
     return () => {
       stopping = true
+      if (resolveTimer !== undefined) {
+        clearTimeout(resolveTimer)
+        resolveTimer = undefined
+      }
+      service.available = false
       if (child !== undefined) {
         try {
           child.kill()

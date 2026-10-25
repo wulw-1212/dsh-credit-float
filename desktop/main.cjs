@@ -24,15 +24,43 @@ let win = null
 let lastState = { rows: [], headline: null, updatedAt: 0, expanded: false, fatal: null, consumedRefreshAt: 0, activeProvider: null, activeModel: null }
 let collapsed = { width: 150, height: 34 }
 
+function defaultPosition() {
+  const area = screen.getPrimaryDisplay().workArea
+  return { x: area.x + area.width - 190, y: area.y + 380 }
+}
+
+/**
+ * Would the capsule actually be reachable at this point?
+ *
+ * The saved position survives monitor changes, so it can name a display that is
+ * no longer attached — the window would then be drawn off-screen and the user
+ * sees "no desktop capsule" while the process is perfectly healthy. Any overlap
+ * with a display's work area counts: a half-off-screen drag is still usable,
+ * while a strictly-inside test would reject it.
+ */
+function isOnSomeDisplay(x, y) {
+  return screen.getAllDisplays().some(display => {
+    const area = display.workArea
+    return (
+      x + collapsed.width > area.x &&
+      x < area.x + area.width &&
+      y + collapsed.height > area.y &&
+      y < area.y + area.height
+    )
+  })
+}
+
 function readPosition() {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
-    if (Number.isFinite(raw?.x) && Number.isFinite(raw?.y)) return { x: raw.x, y: raw.y }
+    if (Number.isFinite(raw?.x) && Number.isFinite(raw?.y)) {
+      if (isOnSomeDisplay(raw.x, raw.y)) return { x: raw.x, y: raw.y }
+      console.warn('[dcf-desktop] 已保存的窗口位置不在任何显示器的工作区内，回到默认位置')
+    }
   } catch {
     /* first run */
   }
-  const area = screen.getPrimaryDisplay().workArea
-  return { x: area.x + area.width - 190, y: area.y + 380 }
+  return defaultPosition()
 }
 
 function savePosition(x, y) {
@@ -56,6 +84,9 @@ function resize(width, height) {
 
 function createWindow() {
   const position = readPosition()
+  // Logged so "capsule missing" reports can be told apart from a stale
+  // off-screen saved position without attaching a debugger.
+  console.log(`[dcf-desktop] 窗口位置: (${position.x}, ${position.y})`)
   win = new BrowserWindow({
     x: position.x,
     y: position.y,
@@ -134,23 +165,65 @@ function onRefreshRequested(at) {
  * profile patch (`ui-theme` config `preference`), which the host can change at
  * runtime, so the value is re-read from the patch file instead of cached once.
  */
-const THEME_PATCH = process.env.DCF_THEME_PATCH || 'D:\\Programs Data\\Dsh\\Dsh-home\\profiles\\desktop\\cordis.patch.yml'
 const THEME_POLL_MS = 5_000
 
 let themePreference = 'system'
+let themePatchPath = ''
 let lastAppliedTheme = null
 
-function readThemePreference() {
+/** The `preference:` of this file's `- id: ui-theme` entry, or null if absent. */
+function readPreferenceFrom(file) {
   try {
-    const text = fs.readFileSync(THEME_PATCH, 'utf8')
+    const text = fs.readFileSync(file, 'utf8')
     // Only the ui-theme block matters; a matching `preference:` under another id
     // must not win, so the search is anchored on the entry id.
     const match = text.match(/- id:\s*ui-theme\b[\s\S]*?\n\s*preference:\s*(light|dark|system)\b/)
     if (match) return match[1]
   } catch {
-    /* patch unreadable: fall back to the OS preference */
+    /* unreadable: no usable preference here */
   }
-  return 'system'
+  return null
+}
+
+/**
+ * Find the profile patch that really declares the appearance preference.
+ *
+ * The path used to be hard-coded to one machine's DSH home, which is wrong on
+ * every other install (and quietly made the capsule ignore the DSH setting), so
+ * resolve it instead: an explicit override wins, then the real profiles
+ * directory is scanned and the first patch carrying a ui-theme preference wins.
+ */
+function findThemePatch() {
+  const explicit = process.env.DCF_THEME_PATCH
+  if (explicit) return explicit
+  const home = process.env.DSH_HOME || path.join(process.env.USERPROFILE || process.env.HOME || '', '.dsh')
+  const profiles = path.join(home, 'profiles')
+  let entries
+  try {
+    entries = fs.readdirSync(profiles, { withFileTypes: true })
+  } catch {
+    return ''
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const candidate = path.join(profiles, entry.name, 'cordis.patch.yml')
+    if (readPreferenceFrom(candidate) !== null) return candidate
+  }
+  return ''
+}
+
+function readThemePreference() {
+  if (!themePatchPath) themePatchPath = findThemePatch()
+  if (!themePatchPath) return 'system'
+  const preference = readPreferenceFrom(themePatchPath)
+  if (preference === null) {
+    // The patch vanished or was rewritten without ui-theme (profile switch,
+    // upgrade, deploy in progress): forget the path so the next poll re-scans
+    // instead of staying pinned to a file that may never come back.
+    themePatchPath = ''
+    return 'system'
+  }
+  return preference
 }
 
 function nativeTheme() {
@@ -369,6 +442,8 @@ app.whenReady().then(() => {
 
   // Appearance: follow the DSH setting, which itself defaults to `system`.
   themePreference = readThemePreference()
+  // Logged so a support session can tell "wrong patch file" from "wrong value".
+  console.log(`[dcf-desktop] 外观偏好: ${themePreference}（补丁: ${themePatchPath || '未找到，跟随系统'}）`)
   if (win !== null && !win.isDestroyed()) {
     win.webContents.once('did-finish-load', () => applyTheme(true))
   }
