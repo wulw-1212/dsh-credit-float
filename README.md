@@ -25,11 +25,17 @@
 
 `skills-dirs.json` 的示例内容：
 
+仓库里带了一份 [`skills-dirs.example.json`](skills-dirs.example.json)，
+把它复制成 `skills-dirs.json` 再改路径即可；**真实的 `skills-dirs.json` 已被
+`.gitignore` 忽略**（里面是本机绝对路径，跟着仓库走会指向别人的磁盘）。
+写路径建议用正斜杠（`D:/skills`）；用反斜杠必须写成两个（`D:\\skills`），
+写成一个会让整个文件变成非法 JSON 而被整层跳过。
+
 ```json
 {
   "dirs": [
-    "D:\\Programs Data\\Dsh\\Dsh-home\\skills",
-    "D:\\my-own-skills"
+    "D:/Programs Data/Dsh/Dsh-home/skills",
+    "D:/my-own-skills"
   ]
 }
 ```

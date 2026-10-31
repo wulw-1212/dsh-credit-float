@@ -1,0 +1,7 @@
+{
+  "_readme": "把本文件复制为 skills-dirs.json（同目录）并改成你自己的路径。skills-dirs.json 已被 .gitignore 忽略，不会进版本库。要监控多个目录就在 dirs 数组里写多项；路径建议用正斜杠（D:/skills），用反斜杠时必须写成两个。下面两条是占位路径，照抄不会生效。",
+  "dirs": [
+    "D:/path/to/your/skills",
+    "C:/another/skills-folder"
+  ]
+}
