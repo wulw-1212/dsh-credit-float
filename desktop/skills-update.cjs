@@ -549,10 +549,130 @@ async function resolveUpstreamRef(git, dir) {
 }
 
 /**
- * One repo's status. `state` is what the UI branches on:
+ * Parse `git status --porcelain=v2 --branch` output into plain counts.
+ *
+ * One call answers both local questions the panel shows: what is uncommitted, and
+ * how far the branch is from its upstream. The `--branch` header carries the
+ * ahead/behind numbers, so this stays a single process per repository.
+ *
+ * `ahead`/`behind` are `null` when the branch has no upstream — "unknown" is not
+ * "zero", and the UI must be able to tell those apart.
+ */
+function parseLocalStatus(text) {
+  const out = {
+    branch: null,
+    upstream: null,
+    ahead: null,
+    behind: null,
+    detached: false,
+    modified: 0,
+    untracked: 0,
+    conflicted: 0,
+  }
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    if (line === '') continue
+    if (line.startsWith('# branch.head ')) {
+      const head = line.slice('# branch.head '.length).trim()
+      out.detached = head === '(detached)'
+      out.branch = out.detached ? null : head
+      continue
+    }
+    if (line.startsWith('# branch.upstream ')) {
+      out.upstream = line.slice('# branch.upstream '.length).trim()
+      continue
+    }
+    if (line.startsWith('# branch.ab ')) {
+      const match = /^\+(\d+) -(\d+)$/.exec(line.slice('# branch.ab '.length).trim())
+      if (match) {
+        out.ahead = Number(match[1])
+        out.behind = Number(match[2])
+      }
+      continue
+    }
+    if (line.startsWith('#')) continue
+    if (line.startsWith('? ')) {
+      out.untracked += 1
+      continue
+    }
+    if (line.startsWith('u ')) {
+      // Unmerged entry: conflicted files are the most urgent kind of dirty.
+      out.conflicted += 1
+      out.modified += 1
+      continue
+    }
+    if (line.startsWith('1 ') || line.startsWith('2 ')) {
+      out.modified += 1
+      continue
+    }
+  }
+  return out
+}
+
+/**
+ * Local state of one repository, or `null` when it cannot be read.
+ *
+ * Read-only and local: no fetch, no lock. Submodule gitlink lag is ignored — a
+ * submodule pointing at a different commit than the index is not the user's edit
+ * and would otherwise mark repositories with submodules permanently dirty.
+ */
+async function readLocalStatus(git, dir) {
+  const res = await runGit(
+    git,
+    ['status', '--porcelain=v2', '--branch', '--ignore-submodules=all'],
+    dir,
+  )
+  if (res.code !== 0) return null
+  return parseLocalStatus(res.stdout)
+}
+
+/**
+ * The local-work flags the panel shows, derived from the raw status counts.
+ *
+ * `unpushed` is measured against the *remote-tracking* ref, i.e. exactly what
+ * `git status` tells the user in a terminal. It can be stale (nothing here
+ * fetches), which is why the UI says "未推送" and never claims a relationship with
+ * the live remote — that comparison comes from `ls-remote` separately.
+ */
+function localFlags(local) {
+  if (local === null || local === undefined) return null
+  const modified = Number(local.modified) || 0
+  const untracked = Number(local.untracked) || 0
+  const conflicted = Number(local.conflicted) || 0
+  const ahead = Number.isFinite(local.ahead) ? Number(local.ahead) : null
+  const behind = Number.isFinite(local.behind) ? Number(local.behind) : null
+  return {
+    dirty: modified + untracked > 0,
+    modified,
+    untracked,
+    conflicted,
+    ahead,
+    behind,
+    unpushed: ahead !== null && ahead > 0,
+    detached: local.detached === true,
+    upstream: local.upstream ?? null,
+  }
+}
+
+/**
+ * Does this repository have anything the user should look at?
+ *
+ * Remote updates are the original reminder; uncommitted or unpushed work is added
+ * because both make a one-click update unusable on that repository (it would be
+ * skipped), and silently skipping is worse than saying why up front.
+ */
+function needsAttention(item) {
+  if (item?.state === 'update') return true
+  const flags = item?.flags
+  if (!flags) return false
+  return flags.dirty || flags.unpushed
+}
+
+/**
+ * One repo's *remote* status. `state` is what the UI branches on:
  *   up-to-date | update | unreachable | unknown | skipped
  */
-async function checkRepo(git, dir, name) {
+async function checkRemote(git, dir, name) {
   const local = await runGit(git, ['rev-parse', 'HEAD'], dir)
   if (local.code !== 0 || !SHA.test(local.stdout.trim())) {
     return { name, state: 'skipped', reason: '本地 HEAD 无法解析' }
@@ -608,6 +728,33 @@ async function checkRepo(git, dir, name) {
     localSha,
     remoteSha,
   }
+}
+
+/**
+ * Everything known about one repository: the remote comparison plus the local
+ * work state.
+ *
+ * Both probes are read-only and independent, so they run together — a slow
+ * `ls-remote` no longer delays the "you have uncommitted work here" answer, and a
+ * failed remote lookup still reports the local half instead of returning a bare
+ * "unreachable".
+ */
+async function checkRepo(git, dir, name) {
+  const [remote, local] = await Promise.all([
+    checkRemote(git, dir, name),
+    readLocalStatus(git, dir),
+  ])
+  const flags = localFlags(local)
+  const item = { ...remote, flags }
+  // `diverged` is the one state whose explanation depends on the local side: a
+  // sha mismatch with nothing to pull means either "my commits are not pushed" or
+  // "the remote rewrote history", and those want different words.
+  if (item.state === 'diverged') {
+    item.reason = flags?.unpushed
+      ? '本地有远端没有的提交（也可能同时被改写过历史），不自动合并'
+      : '远端与本地已分叉（远端可能重写过或回退过历史），需你亲自处理'
+  }
+  return item
 }
 
 /** Run `tasks` with at most `limit` in flight; never rejects. */
@@ -701,6 +848,7 @@ function createSkillsWatcher({
     checked: false,
     items: [],
     updates: [],
+    attention: [],
     lastCheckedAt: 0,
     error: null,
   }
@@ -829,6 +977,17 @@ function createSkillsWatcher({
       const updates = results
         .filter(item => item.state === 'update')
         .sort((a, b) => (b.behind ?? 0) - (a.behind ?? 0) || a.display.localeCompare(b.display))
+      // Everything worth showing a row for: remote updates (the original reminder)
+      // plus repositories carrying uncommitted or unpushed work — the two states
+      // that make an automatic update skip, so they are exactly what the user
+      // needs to see *before* clicking. `updates` stays the narrower list that
+      // 「全部更新」 acts on.
+      const attention = results
+        .filter(needsAttention)
+        .sort((a, b) => {
+          const rank = item => (item.state === 'update' ? 0 : item.flags?.conflicted ? 1 : item.flags?.dirty ? 2 : 3)
+          return rank(a) - rank(b) || a.display.localeCompare(b.display)
+        })
       const failed = results.filter(item => item.state === 'unreachable' || item.state === 'diverged')
 
       const next = publish({
@@ -836,6 +995,7 @@ function createSkillsWatcher({
         checked: true,
         items: results,
         updates,
+        attention,
         lastCheckedAt: Date.now(),
         error:
           failed.length === results.length && results.length > 0
@@ -843,7 +1003,7 @@ function createSkillsWatcher({
             : null,
       })
       log?.debug?.(
-        `[skills] 完成：${updates.length} 个可更新 / ${results.length} 个仓库` +
+        `[skills] 完成：${updates.length} 个可更新 / ${attention.length} 个待处理 / ${results.length} 个仓库` +
           (failed.length ? `，${failed.length} 个异常` : '') +
           (warnings.length ? `，${warnings.length} 条配置警告` : ''),
       )
@@ -1002,6 +1162,11 @@ module.exports = {
   SKILLS_DIRS_CONFIG,
   // exported for tests
   checkRepo,
+  checkRemote,
+  parseLocalStatus,
+  localFlags,
+  needsAttention,
+  readLocalStatus,
   resolveUpstreamRef,
   runGit,
 }

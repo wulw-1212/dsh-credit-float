@@ -220,6 +220,17 @@
   }
   .skills-item .name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .skills-item .behind { color: var(--hint); flex: none; font-variant-numeric: tabular-nums; }
+  /* Status chips: one per fact (uncommitted, unpushed, remote moved). They share
+     a row with the name and the button, so they stay small and never wrap. */
+  .skills-item .chip {
+    flex: none; font-size: 9px; font-weight: 700; line-height: 15px;
+    padding: 0 5px; border-radius: 4px; white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .skills-item .chip.warn { color: var(--warn); border-color: var(--warn); }
+  .skills-item .chip.bad { color: var(--bad); border-color: var(--bad); }
+  .skills-item .chip.hint { color: var(--hint); border-color: var(--hint); }
+  .skills-item .chip.muted { color: var(--muted); border-color: var(--muted); }
   /* Right-hand side of a row: how far behind, then either the per-row update
      button or the outcome of the attempt that just ran for it. */
   .skills-item .tail { display: flex; align-items: baseline; gap: 6px; flex: none; }
@@ -671,22 +682,34 @@
   function renderSkills(payload) {
     if (!payload) return
     skillsState = payload
+    // `updates` = remote has commits we lack (what 「全部更新」 acts on).
+    // `attention` = every repository with something to look at: those, plus the
+    // ones carrying uncommitted or unpushed work. Rows come from `attention`;
+    // keeping the panel quiet about local mess is how a user ends up clicking
+    // "更新" and getting a silent skip.
     const updates = Array.isArray(payload.updates) ? payload.updates : []
+    const attention = Array.isArray(payload.attention) ? payload.attention : updates
     const hasUpdates = updates.length > 0
+    const hasAttention = attention.length > 0
     const roots = Array.isArray(payload.roots) ? payload.roots : []
     // Grouping only ever needs a reason: more than one configured root.
     const grouped = roots.length > 1
 
-    capSkills.classList.toggle('show', hasUpdates)
-    capSkills.textContent = hasUpdates ? `${updates.length} 个技能更新` : ''
-    capSkills.title = hasUpdates
-      ? '技能仓库有远端更新：' + updates.map(u => u.display || u.name).join('、')
+    capSkills.classList.toggle('show', hasAttention)
+    capSkills.textContent = hasAttention
+      ? hasUpdates
+        ? `${updates.length} 个技能更新`
+        : `${attention.length} 项待处理`
+      : ''
+    capSkills.title = hasAttention
+      ? (hasUpdates ? '技能仓库有远端更新：' : '技能仓库待处理：') +
+        attention.map(u => u.display || u.name).join('、')
       : '技能仓库'
 
     // Only shown when there is something to report. Which folders are watched is
     // configured in `skills-dirs.json` / `DCF_SKILLS_DIRS` (see README), not from
     // here — so an idle panel says nothing about directories at all.
-    const showPanel = hasUpdates || payload.checking === true || Boolean(payload.error)
+    const showPanel = hasAttention || payload.checking === true || Boolean(payload.error)
     skillsBox.classList.toggle('hidden', !showPanel)
     if (!showPanel) {
       requestAnimationFrame(report)
@@ -695,10 +718,34 @@
 
     skillsTitle.textContent = payload.checking === true
       ? '正在检查技能更新…'
-      : `${updates.length} 个技能有远端更新`
+      : hasUpdates
+        ? `${updates.length} 个技能有远端更新`
+        : `${attention.length} 个技能待处理`
 
-    const shown = updates.slice(0, 6)
+    const shown = attention.slice(0, 6)
     const outcomeOf = label => skillsOutcomes.get(label) ?? null
+
+    /**
+     * Status chips for one repository: what is uncommitted, what is unpushed, and
+     * whether the remote moved. Several can apply at once (an unpushed commit plus
+     * an edited file is normal), so this is a list, not a single label.
+     */
+    const chipsFor = item => {
+      const chips = []
+      const local = item.local
+      if (local?.conflicted > 0) chips.push({ text: `冲突 ${local.conflicted}`, tone: 'bad' })
+      if (local?.modified > 0) chips.push({ text: `未提交 ${local.modified}`, tone: 'warn' })
+      if (local?.untracked > 0) chips.push({ text: `未跟踪 ${local.untracked}`, tone: 'warn' })
+      if (local?.unpushed) chips.push({ text: `未推送 ${local.ahead}`, tone: 'warn' })
+      if (item.state === 'update') {
+        chips.push({
+          text: Number.isFinite(item.behind) ? `落后 ${item.behind} 个提交` : '远端有新提交',
+          tone: 'hint',
+        })
+      }
+      if (chips.length === 0 && local?.detached) chips.push({ text: '游离 HEAD', tone: 'muted' })
+      return chips
+    }
 
     const makeRow = item => {
       const label = item.display || item.name
@@ -707,15 +754,22 @@
       const name = document.createElement('span')
       name.className = 'name'
       name.textContent = label
-      name.title = item.branch ? `${label}（${item.branch}）` : label
+      const chips = chipsFor(item)
+      // The tooltip carries the *why* for the row as a whole; the chips only say
+      // what, so the panel stays on one line per repository.
+      const explain = []
+      if (item.branch) explain.push(`分支 ${item.branch}`)
+      for (const chip of chips) explain.push(chip.text)
+      if (item.reason) explain.push(item.reason)
+      name.title = `${label}\n${explain.join(' · ')}`
       const tail = document.createElement('span')
       tail.className = 'tail'
-      const behind = document.createElement('span')
-      behind.className = 'behind'
-      behind.textContent = Number.isFinite(item.behind)
-        ? `落后 ${item.behind} 个提交`
-        : '远端有新提交'
-      tail.appendChild(behind)
+      for (const chip of chips) {
+        const el = document.createElement('span')
+        el.className = `chip ${chip.tone}`
+        el.textContent = chip.text
+        tail.appendChild(el)
+      }
 
       // Once this row has been attempted, its outcome replaces the button: the
       // reason a skip happened ("本地有未提交改动") is the whole point of clicking,
@@ -727,7 +781,10 @@
         state.textContent = outcome.ok ? '已更新' : outcome.skipped ? '已跳过' : '失败'
         if (outcome.reason) state.title = String(outcome.reason)
         tail.appendChild(state)
-      } else if (!skillsBusy) {
+      } else if (!skillsBusy && item.state === 'update') {
+        // Only a repository the remote is actually ahead of can be updated. A row
+        // shown purely for local work gets no button rather than one that would
+        // just report a skip.
         const update = document.createElement('button')
         update.type = 'button'
         update.textContent = '更新'
@@ -810,9 +867,15 @@
       // and a stale "N 个技能有远端更新" would contradict the progress below.
       skillsNote.textContent = progressText()
     } else {
+      // The note explains the two different things a row can be telling you, so a
+      // 「未提交」/「未推送」 chip does not read as an unfinished update.
+      const localCount = Number(counts.dirty ?? 0) + Number(counts.unpushed ?? 0)
       skillsNote.textContent =
         payload.error ||
-        '仅在能纯快进时更新：本地有未提交改动、有独有提交、或远端重写了历史都会跳过并说明原因。' +
+        (hasUpdates
+          ? '仅在能纯快进时更新：本地有未提交改动、有独有提交、或远端重写了历史都会跳过并说明原因。'
+          : '这些仓库本地有未提交或未推送的内容，点开目录自行处理；它们不会被自动更新。') +
+          (localCount > 0 && hasUpdates ? ` 另有 ${counts.dirty ?? 0} 个有未提交改动、${counts.unpushed ?? 0} 个有未推送提交。` : '') +
           (counts.unreachable ? ` 另有 ${counts.unreachable} 个仓库连不上远端。` : '') +
           (warningText ? ` ${warningText}` : '')
     }

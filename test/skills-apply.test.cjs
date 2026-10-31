@@ -352,22 +352,165 @@ test('skips a dirty working tree and leaves the edit byte-for-byte intact', asyn
   assert.equal(fileText(fx.repo, 'skill.md'), null, 'upstream content must not have been written')
 })
 
-test('skips when the only local content is an untracked file (the picture-skills case)', async () => {
-  // On this machine the one genuinely dirty skills repo is dirty only because of
-  // an untracked file, so `--untracked-files=all` is load-bearing.
+test('updates a repository whose only local content is an untracked file (the picture-skills case)', async () => {
+  // `picture-skills` was dirty *only* because its generated `output/picture-books/`
+  // is untracked (it is absent from that repository's `.gitignore`), so the old
+  // "untracked files count as dirt" rule kept it from ever being updated.
+  //
+  // This test replaces the previous assertion of that rule. The policy changed on
+  // purpose, for the reason recorded in the module header: a fast-forward cannot
+  // destroy an untracked file — when upstream adds a colliding path, git refuses the
+  // merge by itself (the next test), and otherwise the file is never written. So the
+  // picture-skills case must now be a *success* that keeps the file, and the
+  // `ok: true` here doubles as the assertion that the post-merge verification no
+  // longer reports "an untracked file still exists" as a dirty tree.
   const fx = makeRepoPair('untracked')
   const shaB = upstreamCommit(fx, 'upstream: v2')
-  fs.writeFileSync(path.join(fx.repo, 'scratch-note.md'), 'something I generated locally\n')
+  const generated = 'page 1 of a generated book\n'
+  fs.mkdirSync(path.join(fx.repo, 'output', 'picture-books'), { recursive: true })
+  fs.writeFileSync(path.join(fx.repo, 'output', 'picture-books', 'page.txt'), generated)
 
   const { results, commands } = await runTracked([pending(fx, shaB)])
   const result = one(results)
 
-  assert.equal(result.ok, false)
-  assert.equal(result.skipped, true, 'untracked-only dirt must still be a skip')
-  assert.match(result.reason, /未跟踪/)
-  assert.ok(fs.existsSync(path.join(fx.repo, 'scratch-note.md')), 'the untracked file must still exist')
-  assert.equal(readHead(fx.repo), fx.shaA)
+  assert.equal(
+    result.ok,
+    true,
+    `untracked-only content must not block an update: ${result.reason} / ${result.detail || ''}`,
+  )
+  assert.equal(result.untracked, 1, 'the kept untracked file must be reported on the result')
+  assert.match(result.note || '', /未跟踪/, 'and explained, so a kept file is not read as a clean tree')
+  assert.equal(readHead(fx.repo), shaB, 'HEAD must move to the upstream commit')
+  assert.equal(fileText(fx.repo, 'skill.md'), 'updated upstream\n', 'the upstream file must be on disk')
+  assert.equal(
+    fileText(fx.repo, 'output', 'picture-books', 'page.txt'),
+    generated,
+    'the untracked file must survive byte-for-byte: not deleted, not rewritten',
+  )
+  assert.equal(
+    statusOf(fx.repo),
+    '?? output/picture-books/page.txt',
+    'and must still be untracked afterwards, not staged and not committed',
+  )
+  assert.deepEqual(result.phases, ['start', 'fetch', 'merge', 'done'])
   assert.ok(!commands.includes('clean'), `a clean command would delete it: ${commands}`)
+})
+
+test('fails honestly when an untracked file collides with a path upstream adds', async () => {
+  // The case that makes the relaxed rule safe: git protects the untracked path
+  // itself. Measured on git 2.56, `merge --ff-only` exits 1 with "The following
+  // untracked working tree files would be overwritten by merge" and leaves the
+  // repository exactly as it was. The user asked for an update and git really
+  // refused, so this is a *failure* — reporting it as a skip would hide a real
+  // conflict behind "nothing to do".
+  const fx = makeRepoPair('untracked-collide')
+  const mine = 'my generated book\n'
+  fs.mkdirSync(path.join(fx.repo, 'output', 'books'), { recursive: true })
+  fs.writeFileSync(path.join(fx.repo, 'output', 'books', 'b.md'), mine)
+  const shaB = upstreamCommit(fx, 'upstream: v2', { 'output/books/b.md': 'upstream version\n' })
+  assert.equal(statusOf(fx.repo), '?? output/books/b.md', 'fixture: the local file must be untracked, not modified')
+
+  const { results, commands } = await runTracked([pending(fx, shaB)])
+  const result = one(results)
+
+  assert.equal(result.ok, false, 'a refused merge is not a success')
+  assert.ok(!result.skipped, 'git tried and refused, so this is a failure rather than a skip')
+  assert.equal(result.collision, true, 'the untracked collision must be named on the result')
+  assert.match(result.reason, /未跟踪/, 'the reason must say what collided')
+  assert.match(result.reason, /冲突/)
+  assert.match(result.detail, /untracked working tree files would be overwritten/, 'git’s own words belong in the detail')
+  assert.equal(result.phases.at(-1), 'failed')
+  assert.ok(commands.includes('merge'), 'the merge must really have been attempted')
+  // No half-updated repository: HEAD unmoved, no merge left in progress, no conflict
+  // markers, and the file the user wrote is untouched.
+  assert.equal(readHead(fx.repo), fx.shaA, 'HEAD must not move')
+  assert.equal(result.headUnchanged, true)
+  assert.equal(result.cleanTree, true, 'no *tracked* file was touched, and that is what cleanTree means')
+  assert.equal(result.inProgressMarker, null, 'git must not leave a merge in progress')
+  assert.ok(!fs.existsSync(path.join(fx.repo, '.git', 'MERGE_HEAD')), 'no MERGE_HEAD may be left behind')
+  assert.equal(fileText(fx.repo, 'output', 'books', 'b.md'), mine, 'the user file must be intact')
+  assert.equal(statusOf(fx.repo), '?? output/books/b.md', 'and still simply untracked — no conflict markers')
+})
+
+test('a file created during the fetch does not stop the update, but an edit to a tracked one does', async () => {
+  // The second dirty check runs *after* the fetch (up to 60 s later), so it has to
+  // apply the same rule: a generated file appearing in that window must not abandon
+  // an update that is already half-way, while an edit to tracked content still must.
+  // `onProgress` is called with phase 'fetch' before that re-check runs, which makes
+  // the window deterministic instead of a timing race.
+  const tolerant = makeRepoPair('recheck-untracked')
+  const shaTolerant = upstreamCommit(tolerant, 'upstream: v2')
+  const appeared = 'appeared while the fetch ran\n'
+  const kept = await apply.applySkillUpdates({
+    git: GIT,
+    repos: [pending(tolerant, shaTolerant)],
+    log: null,
+    onProgress: (repo, phase) => {
+      if (phase === 'fetch') fs.writeFileSync(path.join(repo.path, 'appeared-later.md'), appeared)
+    },
+  })
+  const tolerantResult = one(kept)
+  assert.equal(tolerantResult.ok, true, `the re-check must tolerate untracked dirt: ${tolerantResult.reason}`)
+  assert.equal(readHead(tolerant.repo), shaTolerant, 'the update must complete')
+  assert.equal(fileText(tolerant.repo, 'appeared-later.md'), appeared, 'and keep the file that appeared')
+
+  const strict = makeRepoPair('recheck-tracked')
+  const shaStrict = upstreamCommit(strict, 'upstream: v2')
+  const mine = '# skill\nedited while the fetch ran\n'
+  const blocked = await apply.applySkillUpdates({
+    git: GIT,
+    repos: [pending(strict, shaStrict)],
+    log: null,
+    onProgress: (repo, phase) => {
+      if (phase === 'fetch') fs.writeFileSync(path.join(repo.path, 'README.md'), mine)
+    },
+  })
+  const strictResult = one(blocked)
+  assert.equal(strictResult.ok, false, 'a tracked edit during the fetch must still stop the update')
+  assert.equal(strictResult.skipped, true)
+  assert.match(strictResult.reason, /fetch 期间/)
+  assert.equal(readHead(strict.repo), strict.shaA, 'HEAD must not move')
+  assert.equal(fileText(strict.repo, 'README.md'), mine, 'and the mid-fetch edit must survive untouched')
+  assert.equal(fileText(strict.repo, 'skill.md'), null, 'upstream content must not have been written')
+})
+
+test('an untracked listing too long to capture cannot hide a tracked change', async () => {
+  // `--untracked-files=all` on a repository with thousands of generated files can
+  // exceed the module's 256 KB stdout cap, so a listing can arrive cut in half. The
+  // module then asks the blocking question again with `--untracked-files=no`, whose
+  // answer is small enough that it cannot be cut. This fixture is what proves that
+  // path is really taken: `truncated` can only be true if the cap was hit, and the
+  // `dirty` answer below is computed from the second, uncut listing. Long names keep
+  // the file count (and the test's runtime) sane.
+  const fx = makeRepoPair('huge-untracked')
+  const generated = path.join(fx.repo, 'output')
+  fs.mkdirSync(generated, { recursive: true })
+  const name = index => `f${String(index).padStart(4, '0')}-${'x'.repeat(160)}.txt`
+  for (let i = 0; i < 1700; i++) fs.writeFileSync(path.join(generated, name(i)), 'g\n')
+  const listing = ggit(fx.repo, 'status', '--porcelain', '--untracked-files=all').stdout
+  assert.ok(listing.length >= 256 * 1024, `fixture: the listing must exceed the module cap, got ${listing.length}`)
+  const status = await apply.porcelainStatus(GIT, fx.repo)
+  assert.equal(status.truncated, true, 'fixture: the module’s own porcelain listing must hit the cap')
+  assert.equal(status.dirty, false, 'a listing cut inside the untracked block must not read as a tracked change')
+
+  const shaB = upstreamCommit(fx, 'upstream: v2')
+  const first = one(await run([pending(fx, shaB)]))
+  assert.equal(first.ok, true, `a huge untracked listing must not block: ${first.reason} / ${first.detail || ''}`)
+  assert.equal(readHead(fx.repo), shaB)
+  assert.equal(fileText(fx.repo, 'output', name(0)), 'g\n', 'the generated files must be left alone')
+
+  // The strictness must survive the oversized listing too: a tracked edit behind it
+  // still has to block. (Git happens to list tracked changes before untracked ones, so
+  // the ordinary parse would usually see this too; the point of asking twice is that
+  // the answer does not depend on that ordering holding.)
+  const shaC = upstreamCommit(fx, 'upstream: v3', { 'skill.md': 'third\n' })
+  fs.writeFileSync(path.join(fx.repo, 'README.md'), '# skill\nmy own edit\n')
+  const second = one(await run([{ ...pending(fx, shaC), localSha: shaB }]))
+  assert.equal(second.ok, false, 'a tracked edit must still block even when the listing is truncated')
+  assert.equal(second.skipped, true)
+  assert.match(second.reason, /未提交/)
+  assert.equal(readHead(fx.repo), shaB, 'HEAD must not move')
+  assert.equal(fileText(fx.repo, 'README.md'), '# skill\nmy own edit\n', 'and the edit must survive')
 })
 
 test('skips a staged change of the user, including a staged submodule pointer', async () => {
@@ -1155,7 +1298,22 @@ test('the source text contains no forbidden git verb outside comments', () => {
   assert.match(code, /core\.hooksPath=/, 'hooks must be redirected')
   assert.match(code, /'--is-ancestor'/, 'the ancestry test must be the is-ancestor form')
   assert.match(code, /'--no-recurse-submodules'/, 'submodules must not be recursed')
-  assert.match(code, /'--untracked-files=all'/, 'untracked files must count as dirt')
+  // The assertion here used to read `/'--untracked-files=all'/` with the message
+  // "untracked files must count as dirt". That message *was* the old policy and the
+  // policy changed deliberately, so it is rewritten rather than dropped: an
+  // untracked file cannot be destroyed by a fast-forward — git refuses a colliding
+  // upstream path by itself, which the collision test above asserts behaviourally —
+  // and treating it as dirt left `picture-skills` permanently un-updatable. The full
+  // listing is still requested, but now it exists so a result can *report* untracked
+  // files instead of blocking on them.
+  assert.match(code, /'--untracked-files=all'/, 'the full listing must still be requested so untracked files can be reported')
+  assert.match(code, /'--untracked-files=no'/, 'the over-long-listing fallback must ask the tracked-only question')
+  assert.match(code, /startsWith\('\?\?'\)/, 'an entry is untracked only when porcelain marks it ??')
+  assert.match(
+    code,
+    /untracked working tree files\? would be overwritten/i,
+    'the untracked-collision refusal must be recognised, so it is reported as a failure rather than a skip',
+  )
   assert.match(code, /--ignore-submodules=all/, 'post-merge verification must ignore gitlink lag')
 })
 

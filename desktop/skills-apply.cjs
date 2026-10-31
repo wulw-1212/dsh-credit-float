@@ -20,7 +20,26 @@
  * `pull`, no `reset`, no `checkout -f`, no stash, no `clean`, no `rebase`, no
  * `--force`, no `--prune`, and nothing is ever pushed. Where a repository cannot
  * be fast-forwarded it is reported `skipped` with a reason and left byte-for-byte
- * as it was; the user then decides in a real git client what should happen.
+ * as it was; the user then decides in a real git client what should happen. (A
+ * fast-forward that git itself refuses half-way — the untracked-collision case
+ * below — is a *failure*, not a skip: the user asked for an update, git tried, and
+ * git said no.)
+ *
+ * ── What "dirty" means here ─────────────────────────────────────────────────
+ *
+ * Only a change to a **tracked** file blocks an update: staged, unstaged, renamed,
+ * deleted or conflicted content that git has a record of is the user's work sitting
+ * on top of the commit we would leave behind, and a fast-forward would either strand
+ * it on new code or abort mid-checkout. An **untracked** file is not that. Git
+ * protects untracked paths by itself: `merge --ff-only` refuses when upstream adds a
+ * path one of them already occupies (measured on git 2.56: exit 1, `error: The
+ * following untracked working tree files would be overwritten by merge:`, HEAD
+ * unmoved, no `MERGE_HEAD`, the file untouched) and otherwise leaves them exactly as
+ * they were. Measured on this machine, the one skill repository with local content
+ * (`picture-skills`) was "dirty" only because its generated `output/picture-books/`
+ * is untracked, so the older rule kept it from ever being updated. Untracked files
+ * that survive an update are reported on the result (`untracked`, plus a `note` when
+ * there are any) and are never turned into a skip or a failure.
  *
  * The test suite asserts that claim two ways: behaviourally against `file://`
  * fixtures, and by recording every command git actually exec'd (through
@@ -73,6 +92,18 @@ const MAX_STDERR = 32 * 1024
  * calling it a failure would make the UI report an outage where there is none.
  */
 const MISSING_REMOTE_REF = /couldn'?t find remote ref|could not find remote ref/i
+
+/**
+ * git's own words for "a path this merge must write is occupied by an untracked file".
+ *
+ * Measured on git 2.56 in a `file://` fixture: `merge --ff-only` then exits **1**
+ * with `error: The following untracked working tree files would be overwritten by
+ * merge:` followed by the paths, and the repository is left exactly as it was —
+ * HEAD unmoved, index untouched, no `MERGE_HEAD`, the untracked file byte-for-byte
+ * intact. It is the one failure an untracked file can cause, and it is a genuine
+ * refusal rather than a skip, so it gets a reason the user can act on.
+ */
+const UNTRACKED_COLLISION = /untracked working tree files? would be overwritten/i
 
 const GIT_CANDIDATES = [
   process.env.DCF_GIT_PATH,
@@ -353,27 +384,51 @@ async function branchName(git, dir) {
 }
 
 /**
- * Working-tree state, in two deliberately different strictnesses.
+ * The non-empty lines of a porcelain listing, without the platform's line ends.
  *
- * - `ignoreSubmodules: false` — **the dirty check, before merging.** Submodule
- *   drift is reported. A gitlink the user staged, or a submodule checkout they
- *   moved, is *their* state, and a fast-forward would rewrite the recorded pointer
- *   over it. Refusing there is the safe answer.
- * - `ignoreSubmodules: true` — **the verification, after merging.** Measured: a
- *   fast-forward that bumps a gitlink leaves `status --porcelain` reporting
- *   `M child` until somebody runs `submodule update`, which this module never does
- *   (see `submodule.recurse=false`). With default strictness every successful
- *   update of a submodule-bearing skill would be reported as a *failure* on a
- *   repository that is in fact fine. So the relaxed reading decides success, and
- *   the drift is surfaced as the informational flag `submodulesDirty` instead.
- *   Two of the fifteen repositories in this machine's skills folder have a
- *   `.gitmodules`, so this difference is not hypothetical.
+ * Porcelain quotes unusual bytes C-style (`core.quotePath`), so a path containing a
+ * newline arrives as the two characters `\` `n` and a listing can still be split on
+ * `\n` safely.
+ */
+function porcelainLines(text) {
+  return String(text ?? '')
+    .split('\n')
+    .map(line => line.replace(/\r$/, ''))
+    .filter(line => line !== '')
+}
+
+/**
+ * Working-tree state, split into the two kinds of "not clean" porcelain reports.
  *
- * `--untracked-files=all` is not a style choice: untracked files *are* local
- * content the user put there, and a checkout can collide with a path a later
- * commit adds. Measured on the real skills folder, the one repository with local
- * changes (`picture-skills`) is dirty *only* because of an untracked file — the
- * strict rule is what catches it.
+ * The split is the point, because only one of them blocks anything:
+ *
+ * - **`??` entries (untracked files) are information, never dirt.** Nothing about
+ *   them needs our protection — see the header: git refuses a fast-forward whose
+ *   upstream paths collide with them, and otherwise leaves them alone. So they are
+ *   counted and handed to the caller for reporting, and `dirty` ignores them.
+ * - **Everything else is a tracked change** — staged, unstaged, renamed, deleted,
+ *   conflicted, or submodule drift — and every non-`??` line means "do not touch
+ *   this repository".
+ * - `ignoreSubmodules: false` — the dirty check before merging, and the strict
+ *   reading that decides `submodulesDirty` afterwards. Submodule drift is reported
+ *   there: a gitlink the user staged, or a submodule checkout they moved, is *their*
+ *   state, and a fast-forward would rewrite the recorded pointer over it. Refusing
+ *   before the merge is the safe answer.
+ * - `ignoreSubmodules: true` — **the verification, after merging** (and the state
+ *   reported when a merge fails). Measured: a fast-forward that bumps a gitlink
+ *   leaves `status --porcelain` reporting `M child` until somebody runs
+ *   `submodule update`, which this module never does (see `submodule.recurse=false`).
+ *   With default strictness every successful update of a submodule-bearing skill
+ *   would be reported as a *failure* on a repository that is in fact fine. So the
+ *   relaxed reading decides success, and the drift is surfaced as the informational
+ *   flag `submodulesDirty` instead. Two of the fifteen repositories in this
+ *   machine's skills folder have a `.gitmodules`, so this difference is not
+ *   hypothetical.
+ *
+ * `--untracked-files=all` stays even though untracked entries no longer block: the
+ * listing is how a result can still say "there are N untracked files here". Asking
+ * for `--untracked-files=no` would answer the blocking question just as well and
+ * throw that fact away.
  */
 async function porcelainStatus(git, dir, { ignoreSubmodules = false } = {}) {
   const args = [...readGuardArgs(), 'status', '--porcelain', '--untracked-files=all']
@@ -384,10 +439,57 @@ async function porcelainStatus(git, dir, { ignoreSubmodules = false } = {}) {
       ok: false,
       dirty: true,
       text: '',
+      truncated: false,
+      tracked: [],
+      trackedCount: 0,
+      untracked: 0,
+      untrackedText: '',
       reason: (res.stderr || res.stdout).trim().split('\n')[0] || 'git status 失败',
     }
   }
-  return { ok: true, dirty: res.stdout.trim() !== '', text: res.stdout }
+
+  const entries = porcelainLines(res.stdout)
+  let tracked = entries.filter(line => !line.startsWith('??'))
+
+  // `runGit` stops appending at MAX_STDOUT, and a listing cut in half can hide a
+  // tracked entry — the one thing that must never be missed. In that single case,
+  // ask the blocking question again with untracked entries left out: that answer is
+  // small enough that it cannot itself be cut, and it is exactly "is a tracked file
+  // changed?". (The untracked count from a truncated listing is a floor, which is
+  // why it is only ever reported, never acted on.)
+  const truncated = res.stdout.length >= MAX_STDOUT
+  if (truncated) {
+    const narrow = [...readGuardArgs(), 'status', '--porcelain', '--untracked-files=no']
+    if (ignoreSubmodules) narrow.push('--ignore-submodules=all')
+    const again = await runGit(git, narrow, dir)
+    if (again.code !== 0) {
+      return {
+        ok: false,
+        dirty: true,
+        text: res.stdout,
+        truncated: true,
+        tracked: [],
+        trackedCount: 0,
+        untracked: 0,
+        untrackedText: '',
+        reason: (again.stderr || again.stdout).trim().split('\n')[0] || 'git status 失败（未跟踪列表过长）',
+      }
+    }
+    tracked = porcelainLines(again.stdout)
+  }
+
+  const untracked = entries.filter(line => line.startsWith('??'))
+  return {
+    ok: true,
+    // The one reading that blocks anything: is a *tracked* file changed?
+    dirty: tracked.length > 0,
+    text: res.stdout,
+    truncated,
+    tracked,
+    trackedCount: tracked.length,
+    untracked: untracked.length,
+    untrackedText: untracked.join('\n'),
+  }
 }
 
 /**
@@ -415,10 +517,12 @@ function isSha(value) {
 /**
  * Everything that has to be true before a single byte is written.
  *
- * Returns `{ ok: true, branch, from, remote }`, or `{ ok: false, reason, skipped }`
- * where `skipped` separates "this repository is fine, we just will not touch it"
- * from "something is wrong here". Split out from the write so the refusal reasons
- * stay readable and each one is testable on its own.
+ * Returns `{ ok: true, branch, from, remote, untracked }`, or
+ * `{ ok: false, reason, skipped }` where `skipped` separates "this repository is
+ * fine, we just will not touch it" from "something is wrong here". `untracked` is
+ * the number of untracked files seen, reported but never a reason to refuse. Split
+ * out from the write so the refusal reasons stay readable and each one is testable
+ * on its own.
  */
 async function preflight(git, repo) {
   const dir = typeof repo?.path === 'string' ? repo.path : ''
@@ -529,25 +633,33 @@ async function preflight(git, repo) {
     return { ok: false, skipped: true, reason: `仓库有未完成的操作（${marker}），请先由你处理，不更新` }
   }
 
-  // The check that carries the most weight: *any* local content, staged or not,
-  // tracked or untracked, including submodule drift, stops us. A fast-forward's
-  // checkout step refuses to overwrite a tracked modification, but "refuses" there
-  // means git aborts in the middle having already written some files — a report we
-  // would rather never have to make. Strict here, relaxed after the merge: see
-  // `porcelainStatus`.
+  // The check that carries the most weight: a *tracked* local change — staged,
+  // unstaged, renamed, deleted or conflicted, including submodule drift — stops us.
+  // A fast-forward's checkout step refuses to overwrite a tracked modification, but
+  // "refuses" there means git aborts in the middle having already written some files
+  // — a report we would rather never have to make. Strict here, relaxed after the
+  // merge: see `porcelainStatus`.
+  //
+  // Untracked entries are deliberately *not* part of this: git protects them by
+  // itself, and refusing on them made a repository whose only local content is
+  // generated output permanently un-updatable. They are counted instead, and the
+  // count travels on the result so a skip/failure/success can all still say "there
+  // are N untracked files here".
   const status = await porcelainStatus(git, dir)
   if (!status.ok) return { ok: false, reason: `读不到工作区状态：${status.reason}` }
   if (status.dirty) {
-    const all = status.text.trim().split('\n').filter(Boolean)
     return {
       ok: false,
       skipped: true,
-      reason: '本地有未提交改动（含未跟踪文件/子模块变化），不覆盖你的文件',
-      detail: all.slice(0, 8).join('\n') + (all.length > 8 ? `\n…（共 ${all.length} 项）` : ''),
+      reason: '本地已跟踪文件有未提交改动（修改/暂存/删除/重命名/冲突），不覆盖你的文件',
+      detail:
+        status.tracked.slice(0, 8).join('\n') +
+        (status.tracked.length > 8 ? `\n…（共 ${status.tracked.length} 项）` : ''),
+      untracked: status.untracked,
     }
   }
 
-  return { ok: true, branch, from, remote: 'origin' }
+  return { ok: true, branch, from, remote: 'origin', untracked: status.untracked }
 }
 
 /**
@@ -618,6 +730,10 @@ async function applyOneUpdate({ git, repo, noHooksPath, log, onPhase } = {}) {
 
     const pre = await preflight(git, repo)
     result.from = pre.from || ''
+    // Present only when a status listing actually measured it. Untracked files are
+    // reported, never acted on: the field exists so a log or a UI can say "updated,
+    // N untracked files kept" instead of implying the tree was bare.
+    if (typeof pre.untracked === 'number') result.untracked = pre.untracked
     if (!pre.ok) {
       log?.warn?.(`[skills-apply] ${pre.skipped ? '跳过' : '失败'} ${name}：${pre.reason}`)
       return done({
@@ -738,19 +854,22 @@ async function applyOneUpdate({ git, repo, noHooksPath, log, onPhase } = {}) {
 
     // Re-check immediately before writing. The fetch above handed the user up to
     // 60 seconds in which to save a file into this folder or commit in their own
-    // terminal; a check that is a minute old is not a check.
+    // terminal; a check that is a minute old is not a check. Same rule as the first
+    // one: only a *tracked* change stops us, so a generated file dropped in during
+    // the fetch is not a reason to abandon an update that is already half-way.
     const recheck = await porcelainStatus(git, repo.path)
     const nowHead = await headSha(git, repo.path)
     if (!recheck.ok) {
       log?.warn?.(`[skills-apply] ${name} 复查状态失败：${recheck.reason}`)
       return done({ ok: false, reason: `复查工作区状态失败：${recheck.reason}` })
     }
+    if (typeof recheck.untracked === 'number') result.untracked = recheck.untracked
     if (recheck.dirty) {
       return done({
         ok: false,
         skipped: true,
-        reason: 'fetch 期间工作区出现了改动，不覆盖你的文件',
-        detail: recheck.text.trim().split('\n').slice(0, 8).join('\n'),
+        reason: 'fetch 期间已跟踪文件出现未提交改动，不覆盖你的文件',
+        detail: recheck.tracked.slice(0, 8).join('\n'),
       })
     }
     if (nowHead !== pre.from) {
@@ -775,13 +894,27 @@ async function applyOneUpdate({ git, repo, noHooksPath, log, onPhase } = {}) {
       const after = await porcelainStatus(git, repo.path, { ignoreSubmodules: true })
       const afterHead = await headSha(git, repo.path)
       const marker = await findInProgressMarker(git, repo.path)
-      log?.warn?.(`[skills-apply] merge --ff-only 失败 ${name}：${detail.split('\n')[0]}`)
+      const firstLine = detail.split('\n')[0]
+      // The one refusal an untracked file can cause, and the reason untracked files
+      // are safe to leave alone: git protects the path itself. It is a *failure*
+      // rather than a skip — the user asked for an update, we tried, upstream wants
+      // a path their file occupies, and only the user can decide which one wins. The
+      // measured aftermath is a repository that did not move at all, so the fields
+      // below say so instead of leaving the user to guess.
+      const collision = UNTRACKED_COLLISION.test(detail)
+      log?.warn?.(`[skills-apply] merge --ff-only 失败 ${name}：${firstLine}`)
       return done({
         ok: false,
-        reason: `merge --ff-only 失败：${detail.split('\n')[0] || '未知原因'}`,
+        reason: collision
+          ? `上游新增的文件与你的未跟踪文件冲突，git 已中止合并（HEAD 未移动，未留下半合并状态）：${firstLine}`
+          : `merge --ff-only 失败：${firstLine || '未知原因'}`,
         detail,
+        // True means "no *tracked* file differs from the commit HEAD still points
+        // at": the merge refused before writing, so an untracked file still sitting
+        // there is not damage and must not be reported as any.
         headUnchanged: afterHead === pre.from,
         cleanTree: Boolean(after.ok && !after.dirty),
+        collision,
         // Deliberately no automatic recovery. `merge --abort` on a merge that
         // already finished exits 128 and changes nothing (measured), so any
         // "cleanup" here would be theatre at best and a new destructive command at
@@ -793,8 +926,12 @@ async function applyOneUpdate({ git, repo, noHooksPath, log, onPhase } = {}) {
     }
 
     // Prove the outcome instead of trusting the exit code: HEAD at the target, the
-    // branch still attached under the same name, and the tree clean apart from
-    // submodule pointers (see `porcelainStatus` for why that one is relaxed).
+    // branch still attached under the same name, and **no tracked change** left over
+    // apart from submodule pointers (see `porcelainStatus` for why that one is
+    // relaxed). An untracked file that was here before the merge is still here
+    // afterwards and is not dirt: git never writes over one, and when upstream adds a
+    // colliding path the merge above refuses instead of succeeding (see the
+    // collision branch).
     const finalHead = await headSha(git, repo.path)
     const finalBranch = await branchName(git, repo.path)
     const finalStrict = await porcelainStatus(git, repo.path)
@@ -817,22 +954,33 @@ async function applyOneUpdate({ git, repo, noHooksPath, log, onPhase } = {}) {
       })
     }
     if (finalLoose.dirty) {
-      // Real damage: a tracked file is modified, or something appeared that the
-      // commit does not contain.
-      log?.error?.(`[skills-apply] ${name} 更新后工作区不干净`)
+      // Real damage: a *tracked* file still differs from the commit we just merged,
+      // or something else the commit does not contain is staged/modified in it.
+      log?.error?.(`[skills-apply] ${name} 更新后工作区有已跟踪改动`)
       return done({
         ok: false,
-        reason: '更新后工作区不干净（钩子、smudge 过滤或写入中断？），请人工确认',
-        detail: finalLoose.text.trim().split('\n').slice(0, 8).join('\n'),
+        reason: '更新后仍有已跟踪文件与提交不一致（钩子、smudge 过滤或写入中断？），请人工确认',
+        detail: finalLoose.tracked.slice(0, 8).join('\n'),
         stdout: merged.stdout,
       })
     }
 
-    // Success, with one honest footnote: the recorded submodule pointers advanced
-    // but this module does not recurse into submodules, so those checkouts lag.
+    // Success, with honest footnotes rather than an implied clean tree: untracked
+    // files that were kept, and submodule pointers that advanced without their
+    // checkouts following (this module never recurses). Both are information — the
+    // result stays `ok: true`, because neither is damage and neither is a reason to
+    // have refused.
     const submodulesDirty = finalStrict.dirty
+    const untrackedKept = finalLoose.untracked
+    const notes = []
+    if (untrackedKept > 0) {
+      notes.push(`更新成功，同时保留了 ${untrackedKept} 个未跟踪文件（不属于版本库，未被改动，也不会阻止更新）`)
+    }
+    if (submodulesDirty) {
+      notes.push('子模块指针已随更新前进，但子模块检出未同步；需要时请运行 git submodule update --init --recursive')
+    }
     log?.info?.(
-      `[skills-apply] ${name} 已更新 ${pre.from.slice(0, 7)} → ${target.slice(0, 7)}（分支 ${pre.branch}，钩子已禁用${submodulesDirty ? '，子模块指针待同步' : ''}）`,
+      `[skills-apply] ${name} 已更新 ${pre.from.slice(0, 7)} → ${target.slice(0, 7)}（分支 ${pre.branch}，钩子已禁用${submodulesDirty ? '，子模块指针待同步' : ''}${untrackedKept > 0 ? `，保留 ${untrackedKept} 个未跟踪文件` : ''}）`,
     )
     return done({
       ok: true,
@@ -841,9 +989,8 @@ async function applyOneUpdate({ git, repo, noHooksPath, log, onPhase } = {}) {
       to: target,
       hooksSuppressed: true,
       submodulesDirty,
-      ...(submodulesDirty
-        ? { note: '子模块指针已随更新前进，但子模块检出未同步；需要时请运行 git submodule update --init --recursive' }
-        : {}),
+      untracked: untrackedKept,
+      ...(notes.length ? { note: notes.join('；') } : {}),
       stdout: merged.stdout,
     })
   } catch (error) {
@@ -975,6 +1122,7 @@ module.exports = {
   removeNoHooksDir,
   // exported for tests
   preflight,
+  porcelainStatus,
   readGuardArgs,
   writeGuardArgs,
   isUsableBranchName,

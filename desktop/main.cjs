@@ -872,7 +872,39 @@ console.log(
 function publicSkills(snapshot) {
   const items = snapshot.items ?? []
   const updates = snapshot.updates ?? []
+  const attention = snapshot.attention ?? []
   const roots = snapshot.roots ?? []
+
+  /**
+   * One row of the panel.
+   *
+   * `local` is the working-tree half: what is uncommitted and whether the branch
+   * is ahead of its remote-tracking ref. Booleans and counts only — no paths, and
+   * no remote URLs.
+   */
+  const publicItem = item => ({
+    name: item.name,
+    display: item.display || item.name,
+    root: item.root ?? null,
+    rootIndex: Number.isFinite(item.rootIndex) ? item.rootIndex : null,
+    branch: item.branch ?? null,
+    state: item.state ?? null,
+    reason: item.reason ?? null,
+    behind: Number.isFinite(item.behind) ? item.behind : null,
+    short: (item.remoteSha ?? '').slice(0, 7),
+    local: item.flags
+      ? {
+          dirty: item.flags.dirty === true,
+          modified: item.flags.modified ?? 0,
+          untracked: item.flags.untracked ?? 0,
+          conflicted: item.flags.conflicted ?? 0,
+          ahead: Number.isFinite(item.flags.ahead) ? item.flags.ahead : null,
+          unpushed: item.flags.unpushed === true,
+          detached: item.flags.detached === true,
+        }
+      : null,
+  })
+
   return {
     checking: snapshot.checking === true,
     checked: snapshot.checked === true,
@@ -885,18 +917,18 @@ function publicSkills(snapshot) {
     // folders are watched is file configuration (skills-dirs.json /
     // DCF_SKILLS_DIRS, see README) — the panel only groups what it is told.
     roots: roots.map(root => ({ index: root.index, basename: root.basename })),
-    updates: updates.map(item => ({
-      name: item.name,
-      display: item.display || item.name,
-      root: item.root ?? null,
-      rootIndex: Number.isFinite(item.rootIndex) ? item.rootIndex : null,
-      behind: Number.isFinite(item.behind) ? item.behind : null,
-      branch: item.branch ?? null,
-      short: (item.remoteSha ?? '').slice(0, 7),
-    })),
+    // Remote updates: what 「全部更新」 acts on.
+    updates: updates.map(publicItem),
+    // Everything worth a row: updates plus repositories with uncommitted or
+    // unpushed work. A superset of `updates`, in the order the panel shows.
+    attention: attention.map(publicItem),
     counts: {
       total: items.length,
       roots: roots.length,
+      updates: updates.length,
+      attention: attention.length,
+      unpushed: items.filter(i => i.flags?.unpushed === true).length,
+      dirty: items.filter(i => i.flags?.dirty === true).length,
       upToDate: items.filter(i => i.state === 'up-to-date').length,
       unreachable: items.filter(i => i.state === 'unreachable').length,
       diverged: items.filter(i => i.state === 'diverged').length,
