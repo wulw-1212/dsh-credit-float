@@ -17,8 +17,13 @@
     --muted: rgba(31, 35, 40, 0.55);
     --divider: rgba(0, 0, 0, 0.08);
     --hover: rgba(0, 0, 0, 0.06);
-    --shadow: 0 14px 44px rgba(0, 0, 0, 0.18);
-    --shadow-cap: 0 6px 24px rgba(0, 0, 0, 0.14);
+    /* Shadows must fit inside the window's 4px gutter (`GUTTER` in main.cjs).
+       A wider blur (this used to be `0 14px 44px`) gets sliced off by the window
+       edge, and the cut edge reads as a grey rectangle painted behind the panel
+       — the "灰色背景" — because the shadow is opaque where it is clipped. Keep
+       the blur ≤ the gutter and the fade completes inside the window. */
+    --shadow: 0 2px 4px rgba(0, 0, 0, 0.18);
+    --shadow-cap: 0 1px 3px rgba(0, 0, 0, 0.16);
     --ok: #1a7f37;
     --warn: #9a6700;
     --bad: #cf222e;
@@ -37,8 +42,8 @@
     --muted: rgba(255, 255, 255, 0.6);
     --divider: rgba(255, 255, 255, 0.1);
     --hover: rgba(255, 255, 255, 0.14);
-    --shadow: 0 14px 44px rgba(0, 0, 0, 0.55);
-    --shadow-cap: 0 6px 24px rgba(0, 0, 0, 0.45);
+    --shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+    --shadow-cap: 0 1px 3px rgba(0, 0, 0, 0.45);
     --ok: #7ee787;
     --warn: #e3b341;
     --bad: #f85149;
@@ -58,8 +63,8 @@
       --muted: rgba(255, 255, 255, 0.6);
       --divider: rgba(255, 255, 255, 0.1);
       --hover: rgba(255, 255, 255, 0.14);
-      --shadow: 0 14px 44px rgba(0, 0, 0, 0.55);
-      --shadow-cap: 0 6px 24px rgba(0, 0, 0, 0.45);
+      --shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+      --shadow-cap: 0 1px 3px rgba(0, 0, 0, 0.45);
       --ok: #7ee787;
       --warn: #e3b341;
       --bad: #f85149;
@@ -71,8 +76,25 @@
     }
   }
   * { box-sizing: border-box; }
-  html, body {
-    margin: 0; padding: 0; background: transparent;
+  html { height: 100%; margin: 0; padding: 0; background: transparent; }
+  body {
+    margin: 0;
+    /* `box-sizing: border-box` is global, so this padding is taken out of the
+       viewport rather than added to it: the content box is exactly the window
+       minus 4px on every side. That band is where the CSS box-shadow fades, and
+       `report()` sizes the window to box + 8 so the shadow is never cropped. */
+    padding: 4px;
+    height: 100%;
+    /* A column flex container, not a block: `#cap` is `inline-flex`, and in a
+       block the line box it sits in is taller than the capsule by the font's
+       descender, so the measured rect would not match the space the capsule
+       really takes and the shadow's bottom edge would be cropped. As a flex item
+       it has no baseline whitespace, stays content-sized (so it is never stretched
+       like `width: 100%` would), and the panel can still be told to fill. */
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    background: transparent;
     font: 600 13px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
     color: var(--fg); -webkit-user-select: none; user-select: none;
     overflow: hidden; cursor: grab;
@@ -80,6 +102,10 @@
   body.dragging { cursor: grabbing; }
   #cap {
     display: inline-flex; align-items: center; gap: 7px;
+    /* `flex: none` (not `1`): the capsule must never be stretched to the window or
+       squeezed by it — it wraps its text, and `report()` sizes the window to that
+       text. With grow/shrink both off, its box is always exactly the content. */
+    flex: none;
     padding: 7px 12px; border-radius: 999px;
     background: var(--bg-solid); border: 1px solid var(--border);
     box-shadow: var(--shadow-cap); white-space: nowrap;
@@ -91,10 +117,37 @@
   .dot.idle { background: var(--idle); }
 
   #panel {
-    width: 272px; max-height: 560px; overflow: auto; border-radius: 14px;
+    /* Auto (default): the panel sizes to its content and `report()` sizes the
+       window to match, so the collapsed capsule keeps wrapping its text. No height
+       cap here on purpose — the old `max-height: 560px` is what cut the row list
+       off mid-row. A CSS cap would also fight the window: the panel would clamp to
+       560px while the window grew to the content height, leaving dead transparent
+       space below it whose edge still answers a resize hover. When the content
+       genuinely cannot fit the screen, main.cjs switches us to the fill-and-scroll
+       state below, which is the only size that can scroll. */
+    width: 272px; overflow: auto;
+    /* `flex: none`: without it a flex item may shrink to fit the container, so the
+       panel would be squeezed to the current window height and its own box would
+       then under-report the content it is hiding. Refusing to shrink keeps the
+       measured box equal to the content, which is what makes the grow-to-fit
+       conversation with the main process settle instead of wandering. */
+    flex: none;
+    border-radius: 14px;
     background: var(--bg-solid); border: 1px solid var(--border);
     box-shadow: var(--shadow);
+    /* Wheel/trackpad scrolling stays available; only the bar itself is hidden.
+       `scrollbar-width` covers the standard syntax, the pseudo-element covers
+       Chromium (what Electron actually uses). No negative-margin tricks: this
+       removes the bar with zero layout shift, so the content width goes back to
+       the full 272px instead of losing ~17px to the classic Windows scrollbar. */
+    scrollbar-width: none;
+    overscroll-behavior: contain;
   }
+  /* The panel is showing a window size instead of its content size: either the
+     user dragged an edge, or the content does not fit the screen. Either way it
+     fills the window (minus the shadow gutter) and scrolls. */
+  body.sized #panel { width: 100%; height: 100%; }
+  #panel::-webkit-scrollbar { width: 0; height: 0; display: none; }
   #panel.hidden { display: none; }
   .head {
     position: sticky; top: 0; display: flex; align-items: center;
@@ -129,28 +182,95 @@
     color: var(--badge-fg); background: var(--badge-bg);
   }
   .name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .meta { display: flex; flex-direction: column; align-items: flex-end; flex: none; max-width: 132px; }
-  .val { font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; color: var(--ok); }
+  /* Note and value sit on one line: note first, value last, so every value
+     keeps its right edge on the same vertical rule at the row's right side.
+     The meta block may shrink (note ellipsizes) but never overflows the row. */
+  .meta {
+    display: flex; flex-direction: row; align-items: baseline; gap: 6px;
+    flex: 0 1 auto; min-width: 0; white-space: nowrap;
+  }
+  .val { font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; color: var(--ok); flex: none; }
   .val.muted { color: var(--muted); font-weight: 600; }
   .note {
     font-size: 10px; color: var(--bad); text-align: right; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis; max-width: 132px; font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; font-weight: 500;
   }
   .foot { padding: 7px 12px 10px; font-size: 10px; color: var(--muted); text-align: right; }
+
+  /* ── skill repository updates ─────────────────────────────────────────────
+     Hidden until the watcher actually has something to say. Kept visually
+     distinct from the credit rows (its own divider + accent colour) so it does
+     not read as another channel with a broken balance. */
+  #capSkills {
+    display: none; padding: 0 5px; border-radius: 4px; font-size: 9px; font-weight: 700;
+    line-height: 15px; vertical-align: 1px; color: var(--bg-solid); background: var(--hint);
+  }
+  #capSkills.show { display: inline-block; }
+  .skills {
+    border-top: 1px solid var(--divider); margin-top: 4px; padding: 6px 12px 2px;
+  }
+  .skills.hidden { display: none; }
+  .skills-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    font-size: 11px; font-weight: 700; color: var(--hint); margin-bottom: 2px;
+  }
+  .skills-item {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+    font-size: 11px; padding: 2px 0; font-weight: 500;
+  }
+  .skills-item .name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .skills-item .behind { color: var(--hint); flex: none; font-variant-numeric: tabular-nums; }
+  /* Right-hand side of a row: how far behind, then either the per-row update
+     button or the outcome of the attempt that just ran for it. */
+  .skills-item .tail { display: flex; align-items: baseline; gap: 6px; flex: none; }
+  .skills-item button { font-size: 10px; padding: 0 6px; flex: none; }
+  .skills-item .state { font-size: 10px; font-weight: 700; flex: none; color: var(--muted); }
+  .skills-item .state.ok { color: var(--ok); }
+  .skills-item .state.bad { color: var(--bad); }
+  .skills-item .state.skip { color: var(--hint); }
+  /* While a batch runs nothing may be started twice. */
+  .skills.busy button { opacity: 0.45; pointer-events: none; }
+  .skills-note { font-size: 10px; color: var(--muted); line-height: 1.5; font-weight: 500; padding: 2px 0 4px; }
+  .skills-actions { display: flex; justify-content: flex-end; gap: 5px; padding: 2px 0 6px; }
+  /* Multi-root grouping. Only rendered when more than one skills directory is
+     configured — with a single root the list is exactly as it was before, with
+     no heading and no wrapper, so nothing about the default layout changes. */
+  .skills-group + .skills-group { margin-top: 4px; }
+  .skills-group-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    font-size: 10px; font-weight: 700; color: var(--muted);
+    padding: 2px 0; border-top: 1px solid var(--divider); margin-top: 2px;
+  }
+  .skills-group-head .root {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  .skills-group-head button { font-size: 10px; padding: 0 6px; flex: none; }
+  .skills-group-head .group-actions { display: flex; gap: 4px; flex: none; }
 </style>
 </head>
 <body>
-  <div id="cap"><span class="dot idle"></span><span id="capText">积分</span><span id="capBadge" class="badge" style="display:none"></span></div>
+  <div id="cap"><span class="dot idle"></span><span id="capText">积分</span><span id="capBadge" class="badge" style="display:none"></span><span id="capSkills" title="技能仓库有远端更新">更新</span></div>
   <div id="panel" class="hidden">
     <div class="head">
       <span class="title" id="title" title="点击收起">模型积分</span>
       <div class="actions">
+        <button id="fit" title="取消手动尺寸，按内容自适应" style="display:none">自适应</button>
         <button id="refresh" title="立即刷新">刷新</button>
         <button id="collapse" title="收起">×</button>
       </div>
     </div>
     <div class="hint" id="hint" style="display:none"></div>
     <div class="body" id="body"></div>
+    <div class="skills hidden" id="skills">
+      <div class="skills-head"><span id="skillsTitle">技能更新</span></div>
+      <div id="skillsList"></div>
+      <div class="skills-note" id="skillsNote"></div>
+      <div class="skills-actions">
+        <button id="skillsApplyAll" title="把所有有远端更新的技能仓库快进到最新（不会覆盖本地改动）">全部更新</button>
+        <button id="skillsCheck" title="重新检查技能仓库远端">重查</button>
+        <button id="skillsOpen" title="打开技能目录">打开目录</button>
+      </div>
+    </div>
     <div class="foot" id="foot">—</div>
   </div>
 
@@ -166,10 +286,29 @@
   const collapse = document.getElementById('collapse')
   const title = document.getElementById('title')
   const refresh = document.getElementById('refresh')
+  const capSkills = document.getElementById('capSkills')
+  const skillsBox = document.getElementById('skills')
+  const skillsTitle = document.getElementById('skillsTitle')
+  const skillsList = document.getElementById('skillsList')
+  const skillsNote = document.getElementById('skillsNote')
+  const skillsCheck = document.getElementById('skillsCheck')
+  const skillsOpen = document.getElementById('skillsOpen')
+  const skillsApplyAll = document.getElementById('skillsApplyAll')
 
   let expanded = false
   let last = null
   let refreshing = false
+  let skillsState = null
+  /** Per-row outcome of the last batch, keyed by the name the row displays. */
+  const skillsOutcomes = new Map()
+  /** `{ name, phase }` of the repository being worked on right now. */
+  let skillsInFlight = null
+  /** `{ updated, skipped, failed }` once a batch ends. */
+  let skillsSummary = null
+  /** True while a batch is in flight — the whole block stops accepting clicks. */
+  let skillsBusy = false
+  /** Must match `GUTTER` in main.cjs: the shadow band around the drawn box. */
+  const GUTTER = 4
 
   /**
    * Apply the palette. `system` is resolved by the main process (it asks
@@ -196,9 +335,18 @@
   function report() {
     const target = expanded ? panel : cap
     const rect = target.getBoundingClientRect()
+    // The panel is sized by the window once the user dragged an edge or the content
+    // overflowed the screen, so its own box no longer says what the content *needs*:
+    // `scrollHeight` does, and it is the number that keeps `autoPanel` current in the
+    // main process so "自适应" restores the right height. Reporting the box instead
+    // would understate a long list and leave rows below the fold unreachable.
+    const height = expanded ? Math.max(rect.height, panel.scrollHeight) : rect.height
+    // Window = drawn box + the 4px shadow gutter on each side. Whether this may move
+    // the window is the main process's call (see `dcf:resize`): it ignores the report
+    // while a manual size is in effect, so a refresh cannot snap the panel back.
     window.dcfDesktop?.resize({
-      width: Math.ceil(rect.width) + 4,
-      height: Math.ceil(rect.height) + 4,
+      width: Math.ceil(rect.width) + GUTTER * 2,
+      height: Math.ceil(height) + GUTTER * 2,
     })
   }
 
@@ -246,7 +394,11 @@
       const value = document.createElement('span')
       value.className = 'val' + (row.ok ? '' : ' muted')
       value.textContent = row.value
-      meta.appendChild(value)
+      // A row that failed *and* says why shows only the reason: the placeholder
+      // `—` main keeps for `!ok` rows adds nothing next to `未登录`, and the note
+      // alone still keeps its right edge on the same vertical rule as the numbers
+      // (`.meta` is a flex row, so with one child the `gap` simply does not apply).
+      // Rows that failed without a reason keep the `—`, and ok rows are untouched.
       if (row.note) {
         const note = document.createElement('span')
         note.className = 'note'
@@ -254,6 +406,7 @@
         note.title = row.note
         meta.appendChild(note)
       }
+      if (row.ok === true || !row.note) meta.appendChild(value)
       wrap.append(name, meta)
       return wrap
     }))
@@ -275,6 +428,13 @@
     expanded = next === true
     cap.classList.toggle('hidden', expanded)
     panel.classList.toggle('hidden', !expanded)
+    // The main process cannot infer this from the data push: the page omits
+    // `expanded` on a plain refresh so an open panel stays open. Without this call
+    // it believed the panel was *always* collapsed, stamped every panel size into
+    // the capsule's resting geometry, and let the automatic measurement override a
+    // dragged size. It is also how the window knows to jump to the capsule size on
+    // collapse instead of waiting for a frame of the wrong height.
+    window.dcfDesktop?.reportExpanded(expanded)
     requestAnimationFrame(report)
   }
 
@@ -318,57 +478,464 @@
     setTimeout(() => setRefreshing(false), 45_000)
   })
 
-  // ── drag: hold anywhere on the capsule or the panel header ──────────────
-  // Moving the capsule must not expand it, so a gesture only becomes a drag
-  // after the pointer travels past a small threshold; anything shorter stays a
-  // plain click.
+  // ── gestures: move by dragging, resize by dragging an edge ────────────────
+  // Both report *screen-space* deltas, so neither cares about DPI scaling or the
+  // window's own origin. A gesture only starts after the pointer travels past a
+  // small threshold, which is what keeps a drag from also firing the click that
+  // ends on the same element (`dragged`).
   const DRAG_THRESHOLD = 4
+  /** Edge band and corner box, in window pixels. Corners win over edges. */
+  const EDGE_HIT = 6
+  const CORNER_HIT = 12
+  const CURSORS = {
+    n: 'n-resize', s: 's-resize', e: 'e-resize', w: 'w-resize',
+    ne: 'ne-resize', nw: 'nw-resize', se: 'se-resize', sw: 'sw-resize',
+  }
+
   let drag = null
   let dragging = false
   let dragged = false
+  /** `'move'` or `'resize'` — one pointer sequence can only ever be one of them. */
+  let gesture = null
+  /** Edges the current resize gesture is dragging, as `{n,e,s,w}` booleans. */
+  let resizeEdges = null
 
-  function endDrag() {
-    // A pending gesture (press without movement) must be dropped here too,
-    // otherwise the next hover would drag the capsule without a button held.
+  /**
+   * Which edges, if any, is this point over? Returns a key for `CURSORS` or null.
+   *
+   * Tested against the *window*, not the panel rect: the panel is inset by the
+   * gutter, so a hit exactly at the window border is the most useful place to
+   * grab and the gutter band is thin enough that it never overlaps content.
+   * Corners are checked first and get a bigger box than an edge, because hitting a
+   * corner means aiming at a point rather than a line — without the priority the
+   * 12x12 corner would degrade to a single-edge drag at exactly the spot where the
+   * user meant to change both dimensions.
+   */
+  function edgeAt(x, y) {
+    const w = window.innerWidth
+    const h = window.innerHeight
+    // Two edges are only two edges while the band does not cover the whole window;
+    // a tiny window is treated as one big corner so `edges` never contradicts itself.
+    if (w <= CORNER_HIT * 2 || h <= CORNER_HIT * 2) return null
+    const nearNorth = y <= CORNER_HIT
+    const nearSouth = y >= h - CORNER_HIT
+    const nearWest = x <= CORNER_HIT
+    const nearEast = x >= w - CORNER_HIT
+    if (nearNorth && nearWest) return 'nw'
+    if (nearNorth && nearEast) return 'ne'
+    if (nearSouth && nearWest) return 'sw'
+    if (nearSouth && nearEast) return 'se'
+    if (y <= EDGE_HIT) return 'n'
+    if (y >= h - EDGE_HIT) return 's'
+    if (x <= EDGE_HIT) return 'w'
+    if (x >= w - EDGE_HIT) return 'e'
+    return null
+  }
+
+  function edgesOf(key) {
+    return {
+      n: key === 'n' || key === 'ne' || key === 'nw',
+      s: key === 's' || key === 'se' || key === 'sw',
+      w: key === 'w' || key === 'nw' || key === 'sw',
+      e: key === 'e' || key === 'ne' || key === 'se',
+    }
+  }
+
+  function setCursor(key) {
+    document.body.style.cursor = key ? CURSORS[key] : ''
+  }
+
+  /**
+   * Clear the gesture. `dragging` matters beyond the flag itself: the pointer may
+   * have been released outside the window, and a stuck state would make the next
+   * hover move or resize the panel with no button held.
+   */
+  function endGesture() {
     const wasDragging = dragging
+    const kind = gesture
     drag = null
     dragging = false
+    gesture = null
+    resizeEdges = null
     document.body.classList.remove('dragging')
-    if (wasDragging) window.dcfDesktop?.dragEnd()
+    setCursor(null)
+    if (!wasDragging) return
+    if (kind === 'resize') window.dcfDesktop?.resizeEnd()
+    else window.dcfDesktop?.dragEnd()
   }
 
   window.addEventListener('pointerdown', event => {
     if (event.button !== 0) return
     // A press always abandons the previous gesture; otherwise a drag that ended
     // outside the window could leave `dragging` stuck on.
-    endDrag()
+    endGesture()
     if (event.target.closest('button')) return
-    if (expanded && !event.target.closest('.head')) return
+    // The panel is the only resizable surface. Inside it, only the header moves
+    // the window — but the window border resizes it, header or not, so the edge
+    // test runs *before* the `.head` restriction and wins over it.
+    const edge = expanded ? edgeAt(event.clientX, event.clientY) : null
+    if (edge) {
+      gesture = 'resize'
+      resizeEdges = edgesOf(edge)
+      setCursor(edge)
+    } else if (expanded && !event.target.closest('.head')) {
+      // Plain content: no gesture. Text and links stay usable.
+      gesture = null
+      return
+    } else {
+      gesture = 'move'
+    }
     drag = { x: event.screenX, y: event.screenY }
     dragging = false
     dragged = false
   })
   window.addEventListener('pointermove', event => {
-    if (!drag) return
+    // Cursor feedback without a button held, so the resize affordance is findable.
+    if (!drag) {
+      // Collapsed there is nothing to resize, and the answer must be cleared rather
+      // than left alone: folding the panel up while the pointer sat on an edge would
+      // otherwise keep an `*-resize` cursor painted over the capsule.
+      setCursor(expanded ? edgeAt(event.clientX, event.clientY) : null)
+      return
+    }
     const dx = event.screenX - drag.x
     const dy = event.screenY - drag.y
     if (!dragging) {
       if (Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return
       dragging = true
       dragged = true
-      document.body.classList.add('dragging')
-      // The window is still at its resting position, so this origin is exact.
-      window.dcfDesktop?.dragStart()
+      if (gesture === 'move') {
+        document.body.classList.add('dragging')
+        // The window is still at its resting position, so this origin is exact.
+        window.dcfDesktop?.dragStart()
+      } else {
+        // Enter the sized state immediately instead of waiting for the round trip
+        // at pointerup: the panel is `width/height: 100%` in that state, so it
+        // grows under the pointer. Deferred until the end it would stay at 272px
+        // inside a window that is growing, which reads as the drag doing nothing.
+        document.body.classList.add('sized')
+        window.dcfDesktop?.resizeStart()
+      }
     }
-    window.dcfDesktop?.dragMove({ dx, dy })
+    if (gesture === 'move') window.dcfDesktop?.dragMove({ dx, dy })
+    else window.dcfDesktop?.resizeMove({ dx, dy, edges: resizeEdges })
   })
-  window.addEventListener('pointerup', endDrag)
-  window.addEventListener('pointercancel', endDrag)
-  window.addEventListener('blur', endDrag)
+  window.addEventListener('pointerup', endGesture)
+  window.addEventListener('pointercancel', endGesture)
+  window.addEventListener('blur', endGesture)
+  // Leaving the window must not leave a resize cursor painted on the desktop.
+  window.addEventListener('pointerleave', () => {
+    if (!drag) setCursor(null)
+  })
+
+  /**
+   * Follow the main process's answer about the panel size: `manual` means the
+   * user dragged it, so the panel fills the window instead of sizing to content.
+   * The button that undoes it only exists while that is true — a reset nobody can
+   * reach is how "I can't resize it any more" complaints start.
+   */
+  const fitButton = document.getElementById('fit')
+  function applyManualSize(payload) {
+    const manual = payload?.manual === true
+    // Either reason needs the fill-and-scroll state; only the dragged one deserves
+    // a button, because giving up a size the screen forced is not a thing the user
+    // can undo by clicking.
+    document.body.classList.toggle('sized', manual || payload?.capped === true)
+    fitButton.style.display = manual ? '' : 'none'
+    // Returning to auto is exactly the moment the panel must be measured again: the
+    // click handler cannot do it, because this message arrives after the IPC round
+    // trip and a frame scheduled from the click would still see the old state.
+    if (!manual) requestAnimationFrame(report)
+  }
+  if (window.dcfDesktop?.initialManualSize) applyManualSize(window.dcfDesktop.initialManualSize)
+  window.dcfDesktop?.onManualSize(applyManualSize)
+
+  fitButton.addEventListener('click', event => {
+    event.stopPropagation()
+    window.dcfDesktop?.resetPanelSize()
+  })
+
+  /**
+   * Skill repository updates.
+   *
+   * The collapsed capsule carries only a count badge — the detail lives in the
+   * panel. Nothing is shown before the first pass completes: "0 updates" would
+   * claim a verified-clean answer the watcher has not given yet.
+   *
+   * Several skills directories may be configured (`DCF_SKILLS_DIRS` or
+   * `skills-dirs.json`). Then the list is grouped per directory with a small
+   * heading and its own 打开 button; with one directory the markup is exactly the
+   * flat list it always was. `payload.roots` carries only basenames and indexes —
+   * the absolute paths never reach this document.
+   */
+  function renderSkills(payload) {
+    if (!payload) return
+    skillsState = payload
+    const updates = Array.isArray(payload.updates) ? payload.updates : []
+    const hasUpdates = updates.length > 0
+    const roots = Array.isArray(payload.roots) ? payload.roots : []
+    // Grouping only ever needs a reason: more than one configured root.
+    const grouped = roots.length > 1
+
+    capSkills.classList.toggle('show', hasUpdates)
+    capSkills.textContent = hasUpdates ? `${updates.length} 个技能更新` : ''
+    capSkills.title = hasUpdates
+      ? '技能仓库有远端更新：' + updates.map(u => u.display || u.name).join('、')
+      : '技能仓库'
+
+    // Only shown when there is something to report. Which folders are watched is
+    // configured in `skills-dirs.json` / `DCF_SKILLS_DIRS` (see README), not from
+    // here — so an idle panel says nothing about directories at all.
+    const showPanel = hasUpdates || payload.checking === true || Boolean(payload.error)
+    skillsBox.classList.toggle('hidden', !showPanel)
+    if (!showPanel) {
+      requestAnimationFrame(report)
+      return
+    }
+
+    skillsTitle.textContent = payload.checking === true
+      ? '正在检查技能更新…'
+      : `${updates.length} 个技能有远端更新`
+
+    const shown = updates.slice(0, 6)
+    const outcomeOf = label => skillsOutcomes.get(label) ?? null
+
+    const makeRow = item => {
+      const label = item.display || item.name
+      const row = document.createElement('div')
+      row.className = 'skills-item'
+      const name = document.createElement('span')
+      name.className = 'name'
+      name.textContent = label
+      name.title = item.branch ? `${label}（${item.branch}）` : label
+      const tail = document.createElement('span')
+      tail.className = 'tail'
+      const behind = document.createElement('span')
+      behind.className = 'behind'
+      behind.textContent = Number.isFinite(item.behind)
+        ? `落后 ${item.behind} 个提交`
+        : '远端有新提交'
+      tail.appendChild(behind)
+
+      // Once this row has been attempted, its outcome replaces the button: the
+      // reason a skip happened ("本地有未提交改动") is the whole point of clicking,
+      // and a still-present button would invite a second identical attempt.
+      const outcome = outcomeOf(label)
+      if (outcome !== null && !skillsBusy) {
+        const state = document.createElement('span')
+        state.className = 'state ' + (outcome.ok ? 'ok' : outcome.skipped ? 'skip' : 'bad')
+        state.textContent = outcome.ok ? '已更新' : outcome.skipped ? '已跳过' : '失败'
+        if (outcome.reason) state.title = String(outcome.reason)
+        tail.appendChild(state)
+      } else if (!skillsBusy) {
+        const update = document.createElement('button')
+        update.type = 'button'
+        update.textContent = '更新'
+        update.title = `只更新 ${label}（仅快进，工作区有改动时会跳过）`
+        update.addEventListener('click', event => {
+          event.stopPropagation()
+          startApply({ name: item.name, rootIndex: item.rootIndex ?? null })
+        })
+        tail.appendChild(update)
+      }
+
+      row.append(name, tail)
+      return row
+    }
+
+    if (!grouped) {
+      skillsList.replaceChildren(...shown.map(makeRow))
+    } else {
+      // One block per configured root, in configured order. Every root is drawn
+      // even when it has nothing pending: the heading is where the per-root
+      // 打开/移除 buttons live, so hiding a root would also hide the only way to
+      // unconfigure it.
+      const groups = []
+      const placed = new Set()
+      for (const root of roots) {
+        const mine = shown.filter(item => (item.rootIndex ?? null) === root.index)
+        for (const item of mine) placed.add(item)
+        const group = document.createElement('div')
+        group.className = 'skills-group'
+        const head = document.createElement('div')
+        head.className = 'skills-group-head'
+        const label = document.createElement('span')
+        label.className = 'root'
+        label.textContent = root.basename
+        label.title = root.source === 'env'
+          ? `${root.basename}（来自环境变量 DCF_SKILLS_DIRS）`
+          : root.source === 'default'
+            ? `${root.basename}（默认目录）`
+            : root.basename
+        const buttons = document.createElement('span')
+        buttons.className = 'group-actions'
+        const open = document.createElement('button')
+        open.type = 'button'
+        open.title = `打开 ${root.basename}`
+        open.textContent = '打开'
+        open.addEventListener('click', event => {
+          event.stopPropagation()
+          window.dcfDesktop?.openSkillsDir(root.index)
+        })
+        buttons.appendChild(open)
+        head.append(label, buttons)
+        group.append(head, ...mine.map(makeRow))
+        groups.push(group)
+      }
+      // Insurance against a row whose root index matches no known root (a shape
+      // mismatch, never a normal pass): drop it at the end ungrouped rather than
+      // let it vanish from the list without a trace.
+      const stray = shown.filter(item => !placed.has(item))
+      if (stray.length > 0) groups.push(...stray.map(makeRow))
+      skillsList.replaceChildren(...groups)
+    }
+    if (updates.length > 6) {
+      const more = document.createElement('div')
+      more.className = 'skills-note'
+      more.textContent = `另有 ${updates.length - 6} 个未列出`
+      skillsList.appendChild(more)
+    }
+
+    const counts = payload.counts || {}
+    // A configuration that failed to parse is worth saying: the user may have
+    // just edited skills-dirs.json and would otherwise see folders missing with
+    // no reason. Basename-level text only, and capped so one bad line cannot
+    // push the panel off the screen.
+    const warningText = (Array.isArray(payload.warnings) ? payload.warnings : [])
+      .slice(0, 2)
+      .join(' ')
+    skillsBox.classList.toggle('busy', skillsBusy)
+    if (skillsBusy) {
+      // A running batch owns the note line: the list is being rewritten under it
+      // and a stale "N 个技能有远端更新" would contradict the progress below.
+      skillsNote.textContent = progressText()
+    } else {
+      skillsNote.textContent =
+        payload.error ||
+        '仅在能纯快进时更新：本地有未提交改动、有独有提交、或远端重写了历史都会跳过并说明原因。' +
+          (counts.unreachable ? ` 另有 ${counts.unreachable} 个仓库连不上远端。` : '') +
+          (warningText ? ` ${warningText}` : '')
+    }
+    skillsCheck.disabled = payload.checking === true || skillsBusy
+    skillsApplyAll.disabled = skillsBusy || !hasUpdates
+
+    // The big button keeps its meaning: single root → that root; multiple roots
+    // → the first one with a pending update (the main process picks it, since it
+    // is the one holding the paths).
+    skillsOpen.title = grouped ? '打开第一个有更新的技能目录' : '打开技能目录'
+
+    requestAnimationFrame(report)
+  }
+
+  skillsCheck.addEventListener('click', event => {
+    event.stopPropagation()
+    window.dcfDesktop?.checkSkills()
+  })
+  skillsOpen.addEventListener('click', event => {
+    event.stopPropagation()
+    window.dcfDesktop?.openSkillsDir()
+  })
+
+  // ── one-click update ──────────────────────────────────────────────────────
+  const PHASE_LABEL = {
+    queued: '排队',
+    start: '准备',
+    fetch: '拉取',
+    merge: '合并',
+    done: '完成',
+    skipped: '跳过',
+    failed: '失败',
+  }
+
+  /** What the note line says while a batch runs or right after it ends. */
+  function progressText() {
+    if (skillsBusy) {
+      const done = skillsOutcomes.size
+      const total = Number(skillsState?.updates?.length) || done || 0
+      const head = total > 0 ? `正在更新（${done}/${total}）` : '正在更新…'
+      if (skillsInFlight === null) return head
+      const phase = PHASE_LABEL[skillsInFlight.phase] || ''
+      return phase ? `${head}：${skillsInFlight.name}（${phase}）` : `${head}：${skillsInFlight.name}`
+    }
+    if (skillsSummary === null) return ''
+    const { updated, skipped, failed } = skillsSummary
+    let text = `更新完成：成功 ${updated}`
+    if (skipped > 0) text += ` · 跳过 ${skipped}`
+    if (failed > 0) text += ` · 失败 ${failed}`
+    // The first non-success reason is the one the user needs; without it "跳过"
+    // is a word that explains nothing.
+    for (const outcome of skillsOutcomes.values()) {
+      if (outcome.ok !== true && outcome.reason) {
+        text += `。${outcome.name}：${String(outcome.reason).split('\n')[0]}`
+        break
+      }
+    }
+    return text
+  }
+
+  function startApply(request) {
+    if (skillsBusy) return
+    skillsBusy = true
+    skillsOutcomes.clear()
+    skillsInFlight = null
+    skillsSummary = null
+    skillsBox.classList.add('busy')
+    skillsApplyAll.disabled = true
+    skillsCheck.disabled = true
+    if (skillsState !== null) renderSkills(skillsState)
+    window.dcfDesktop?.applySkills(request)
+  }
+
+  /**
+   * Batch progress from the main process.
+   *
+   * Consecutive events only ever move forward, so the renderer accumulates rather
+   * than replacing: a row that has already ended keeps its outcome while later
+   * rows are still being worked on.
+   */
+  function renderSkillsProgress(payload) {
+    if (!payload) return
+    if (payload.applying === true) {
+      skillsBusy = true
+      skillsBox.classList.add('busy')
+      if (payload.result && typeof payload.result.name === 'string') {
+        skillsOutcomes.set(payload.result.name, payload.result)
+        skillsInFlight = null
+      } else if (typeof payload.inFlight === 'string') {
+        skillsInFlight = { name: payload.inFlight, phase: payload.phase || '' }
+      }
+    } else {
+      skillsBusy = false
+      skillsInFlight = null
+      skillsBox.classList.remove('busy')
+      if (payload.summary) skillsSummary = payload.summary
+      for (const result of Array.isArray(payload.results) ? payload.results : []) {
+        if (typeof result?.name === 'string') skillsOutcomes.set(result.name, result)
+      }
+      if (payload.error && skillsSummary === null) skillsSummary = { updated: 0, skipped: 0, failed: 0 }
+      skillsApplyAll.disabled = false
+      skillsCheck.disabled = false
+    }
+    // Re-render from the last snapshot so row buttons/outcomes follow the batch.
+    if (skillsState !== null) renderSkills(skillsState)
+  }
+
+  skillsApplyAll.addEventListener('click', event => {
+    event.stopPropagation()
+    startApply({ all: true })
+  })
 
   window.dcfDesktop?.onState(render)
+  window.dcfDesktop?.onSkills(renderSkills)
+  window.dcfDesktop?.onSkillsProgress(renderSkillsProgress)
+  // Ask for the current snapshot: the first pass may have finished before this
+  // document was ready, and the next one is hours away.
+  window.dcfDesktop?.skillsReady()
   window.addEventListener('resize', () => requestAnimationFrame(report))
   requestAnimationFrame(report)
+
+  if (window.dcfDesktop?.initialSkills) renderSkills(window.dcfDesktop.initialSkills)
+  if (window.dcfDesktop?.initialSkillsProgress) renderSkillsProgress(window.dcfDesktop.initialSkillsProgress)
 
   if (window.dcfDesktop?.initial) render(window.dcfDesktop.initial)
 </script>

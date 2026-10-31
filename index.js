@@ -66,6 +66,7 @@ export function apply(ctx) {
   let stopping = false
   let restarts = 0
   let resolveTimer
+  let stableTimer
   let warnedMissingElectron = false
 
   // One stable object, published immediately so the browser half can find the
@@ -98,9 +99,22 @@ export function apply(ctx) {
     resolveTimer.unref?.()
   }
 
+  /**
+   * Restart budget.
+   *
+   * The cap exists to stop a crash loop (a bad main.cjs that dies on startup
+   * would otherwise be respawned forever). It must not be *lifetime* budget:
+   * three restarts spread harmlessly over a long session — a machine waking from
+   * sleep, one manual reload, a GPU hiccup — used to disable the desktop capsule
+   * permanently until DSH restarted. So the count is forgiven once a helper has
+   * stayed up long enough to prove it was not a startup crash.
+   */
+  const MAX_RESTARTS = 3
+  const STABLE_MS = 30_000
+
   const scheduleRestart = reason => {
     if (stopping) return
-    if (restarts >= 3) {
+    if (restarts >= MAX_RESTARTS) {
       ctx.logger?.warn?.('dsh-credit-float: 桌面胶囊连续退出，已停止重启')
       return
     }
@@ -157,6 +171,10 @@ export function apply(ctx) {
     const onGone = reason => {
       if (settled) return
       settled = true
+      if (stableTimer !== undefined) {
+        clearTimeout(stableTimer)
+        stableTimer = undefined
+      }
       if (child === proc) child = undefined
       service.available = false
       scheduleRestart(reason)
@@ -172,6 +190,14 @@ export function apply(ctx) {
 
     proc.once('spawn', () => {
       service.available = true
+      // Surviving this long means the helper is not crash-looping on startup, so
+      // the budget is forgiven. A bad build still burns all 3 attempts quickly
+      // (each dies in well under STABLE_MS) and then stops, as intended.
+      stableTimer = setTimeout(() => {
+        stableTimer = undefined
+        if (child === proc) restarts = 0
+      }, STABLE_MS)
+      stableTimer.unref?.()
       ctx.logger?.info?.(`dsh-credit-float: 桌面胶囊已启动（127.0.0.1:${port}）`)
     })
   }
@@ -183,6 +209,10 @@ export function apply(ctx) {
       if (resolveTimer !== undefined) {
         clearTimeout(resolveTimer)
         resolveTimer = undefined
+      }
+      if (stableTimer !== undefined) {
+        clearTimeout(stableTimer)
+        stableTimer = undefined
       }
       service.available = false
       if (child !== undefined) {

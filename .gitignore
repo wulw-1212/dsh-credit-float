@@ -1,2 +1,6 @@
 # 桌面胶囊窗口位置：拖动窗口就会改写，不进版本库
 .dsh-credit-float-window.json
+# 技能更新提醒的去重状态：每次检查都会改写，不进版本库
+.dsh-credit-float-skills.json
+# 本机技能目录配置：路径因机器而异，不进版本库
+skills-dirs.json
