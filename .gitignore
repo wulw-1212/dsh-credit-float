@@ -2,5 +2,5 @@
 .dsh-credit-float-window.json
 # 技能更新提醒的去重状态：每次检查都会改写，不进版本库
 .dsh-credit-float-skills.json
-# 注意：skills-dirs.json 是**有意**纳入版本库的（技能目录配置随仓库走），
-# 不要加回忽略列表；示例格式见 skills-dirs.example.json。
+# 本机技能目录配置：里面是本机绝对路径，不进版本库（格式参考 skills-dirs.example.json）
+skills-dirs.json
