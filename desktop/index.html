@@ -318,6 +318,24 @@
   let skillsSummary = null
   /** True while a batch is in flight — the whole block stops accepting clicks. */
   let skillsBusy = false
+  /**
+   * How long the "your configuration took effect" line stays on screen. Long
+   * enough to read after an edit, short enough that an idle panel goes back to
+   * being invisible.
+   */
+  const SKILLS_STATUS_MS = 10_000
+  /**
+   * Last *checked* picture, as the two things the panel can see: the main
+   * process's roots revision and the repository total. When either changes, the
+   * user's edit to `skills-dirs.json` has become visible.
+   */
+  let skillsRootsRevision = null
+  let skillsRepoTotal = null
+  /** Non-empty while that confirmation line is shown. */
+  let skillsStatusText = ''
+  let skillsStatusTimer = null
+  /** Set by 「重查」: a manual check always deserves the confirmation line. */
+  let skillsStatusPending = false
   /** Must match `GUTTER` in main.cjs: the shadow band around the drawn box. */
   const GUTTER = 4
 
@@ -694,6 +712,42 @@
     const roots = Array.isArray(payload.roots) ? payload.roots : []
     // Grouping only ever needs a reason: more than one configured root.
     const grouped = roots.length > 1
+    const counts = payload.counts || {}
+    const total = Number(counts.total) || 0
+    // "Did my edit to skills-dirs.json do anything?" — answered on the spot.
+    // `rootsRevision` is bumped by the main process whenever the resolved set of
+    // configured folders changes (it never carries a path), and `total` is the
+    // repository count. Before this, a configuration that was perfectly correct
+    // but had nothing pending looked exactly like no configuration at all: the
+    // panel is hidden when idle, so a successful edit produced no visible change.
+    // A change — or a manual 重查 — shows one read-only confirmation line for a
+    // few seconds. This is not configuration UI: there is still no way to add or
+    // remove a folder from here.
+    if (payload.checking !== true && payload.checked === true) {
+      const revision = Number(payload.rootsRevision) || 0
+      const changed = skillsRootsRevision !== null && revision !== skillsRootsRevision
+      const grown = skillsRepoTotal !== null && total !== skillsRepoTotal
+      const manual = skillsStatusPending
+      skillsRootsRevision = revision
+      skillsRepoTotal = total
+      skillsStatusPending = false
+      if (changed || grown || manual) {
+        skillsStatusText =
+          `技能目录已更新：${roots.length} 个目录 · ${total} 个仓库` +
+          (hasUpdates ? ` · ${updates.length} 个可更新` : ' · 无更新')
+        if (skillsStatusTimer !== null) clearTimeout(skillsStatusTimer)
+        skillsStatusTimer = setTimeout(() => {
+          skillsStatusTimer = null
+          skillsStatusText = ''
+          // Re-render from the last snapshot: that is what pulls the line back in
+          // (and reports the new window size) once nothing needs a row. Going
+          // through renderSkills keeps the visibility rule in exactly one place.
+          if (skillsState !== null) renderSkills(skillsState)
+          else requestAnimationFrame(report)
+        }, SKILLS_STATUS_MS)
+      }
+    }
+    const hasStatus = skillsStatusText !== '' && payload.checking !== true
 
     capSkills.classList.toggle('show', hasAttention)
     capSkills.textContent = hasAttention
@@ -708,8 +762,10 @@
 
     // Only shown when there is something to report. Which folders are watched is
     // configured in `skills-dirs.json` / `DCF_SKILLS_DIRS` (see README), not from
-    // here — so an idle panel says nothing about directories at all.
-    const showPanel = hasAttention || payload.checking === true || Boolean(payload.error)
+    // here — so an idle panel says nothing about directories at all. The one
+    // exception is the transient confirmation line above, which is a *statement*
+    // that the file was read, not a place to edit it.
+    const showPanel = hasAttention || payload.checking === true || Boolean(payload.error) || hasStatus
     skillsBox.classList.toggle('hidden', !showPanel)
     if (!showPanel) {
       requestAnimationFrame(report)
@@ -720,7 +776,9 @@
       ? '正在检查技能更新…'
       : hasUpdates
         ? `${updates.length} 个技能有远端更新`
-        : `${attention.length} 个技能待处理`
+        : hasAttention
+          ? `${attention.length} 个技能待处理`
+          : '技能目录'
 
     const shown = attention.slice(0, 6)
     const outcomeOf = label => skillsOutcomes.get(label) ?? null
@@ -853,7 +911,6 @@
       skillsList.appendChild(more)
     }
 
-    const counts = payload.counts || {}
     // A configuration that failed to parse is worth saying: the user may have
     // just edited skills-dirs.json and would otherwise see folders missing with
     // no reason. Basename-level text only, and capped so one bad line cannot
@@ -866,6 +923,16 @@
       // A running batch owns the note line: the list is being rewritten under it
       // and a stale "N 个技能有远端更新" would contradict the progress below.
       skillsNote.textContent = progressText()
+    } else if (hasStatus) {
+      // The confirmation line replaces the usual explanation: with nothing
+      // pending there is nothing to explain, and this is the sentence that tells
+      // the user their edit was read.
+      skillsNote.textContent = skillsStatusText
+    } else if (!hasAttention) {
+      // Mid-pass with nothing to explain yet: the sentences below describe rows
+      // that do not exist on this snapshot, and a config-triggered pass makes this
+      // state common (the line itself only appears once the pass has finished).
+      skillsNote.textContent = '正在读取技能目录配置…' + (warningText ? ` ${warningText}` : '')
     } else {
       // The note explains the two different things a row can be telling you, so a
       // 「未提交」/「未推送」 chip does not read as an unfinished update.
@@ -892,6 +959,10 @@
 
   skillsCheck.addEventListener('click', event => {
     event.stopPropagation()
+    // A manual check is the user *verifying* the configuration, so its result is
+    // always shown as the confirmation line — even when nothing changed since the
+    // last pass, which is exactly the case the changed/unchanged test cannot see.
+    skillsStatusPending = true
     window.dcfDesktop?.checkSkills()
   })
   skillsOpen.addEventListener('click', event => {

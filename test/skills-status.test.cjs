@@ -56,6 +56,21 @@ const CONFLICTED = [
   '',
 ].join('\n')
 
+/**
+ * The `picture-skills` case: a repository whose only local content is generated
+ * output that was never added to the repository.
+ */
+const UNTRACKED_ONLY = [
+  '# branch.oid 6666666666666666666666666666666666666666',
+  '# branch.head main',
+  '# branch.upstream origin/main',
+  '# branch.ab +0 -0',
+  '? output/',
+  '? output/picture-books/',
+  '? notes.txt',
+  '',
+].join('\n')
+
 test('a clean branch with an upstream parses to zeroes', () => {
   const parsed = detector.parseLocalStatus(CLEAN)
   assert.equal(parsed.branch, 'main')
@@ -161,4 +176,48 @@ test('a repository behind and dirty produces both chips worth of facts', () => {
   assert.equal(detector.needsAttention(item), true)
   assert.equal(item.flags.dirty, true)
   assert.equal(item.flags.unpushed, true)
+})
+
+test('untracked files are not dirt and do not earn a row of their own', () => {
+  const parsed = detector.parseLocalStatus(UNTRACKED_ONLY)
+  assert.equal(parsed.untracked, 3)
+  assert.equal(parsed.modified, 0)
+
+  const flags = detector.localFlags(parsed)
+  assert.equal(flags.dirty, false, 'untracked content is not tracked dirt')
+  assert.equal(flags.untrackedOnly, true, 'the old `dirty` case is still nameable')
+  assert.equal(flags.untracked, 3, 'the count itself survives for the chips')
+
+  // The picture-skills case: no remote update, nothing tracked changed. It used to
+  // produce a row whose only chip was 未跟踪 N and which had no button at all.
+  assert.equal(detector.needsAttention({ state: 'up-to-date', flags }), false)
+
+  // Untracked files never *remove* a row that something else earned, and the count
+  // is still there for the 未跟踪 N chip on it. `state === 'update'` is also what
+  // gives the row its 更新 button.
+  const behind = { state: 'update', behind: 2, flags }
+  assert.equal(detector.needsAttention(behind), true)
+  assert.equal(behind.state, 'update', 'the update row keeps its button condition')
+  assert.equal(behind.flags.untracked, 3, '…and still says 未跟踪 3')
+
+  const unpushed = {
+    state: 'up-to-date',
+    flags: detector.localFlags({ ...parsed, ahead: 1 }),
+  }
+  assert.equal(detector.needsAttention(unpushed), true)
+  assert.equal(unpushed.flags.untrackedOnly, true)
+})
+
+test('a tracked change is still dirt, and dirty never means "untracked only"', () => {
+  const flags = detector.localFlags(detector.parseLocalStatus(AHEAD_AND_DIRTY))
+  assert.equal(flags.dirty, true)
+  assert.equal(flags.untrackedOnly, false, 'a real tracked change is not the untracked-only case')
+  assert.equal(detector.needsAttention({ state: 'up-to-date', flags }), true)
+
+  // A conflict is tracked dirt too (`parseLocalStatus` folds it into `modified`),
+  // so it keeps its row and its 冲突 chip.
+  const conflicted = detector.localFlags(detector.parseLocalStatus(CONFLICTED))
+  assert.equal(conflicted.dirty, true)
+  assert.equal(conflicted.untrackedOnly, false)
+  assert.equal(detector.needsAttention({ state: 'up-to-date', flags: conflicted }), true)
 })

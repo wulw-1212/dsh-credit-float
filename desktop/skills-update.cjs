@@ -25,6 +25,25 @@ const fs = require('node:fs')
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000
 /** Let the window finish loading before the first network round. */
 const FIRST_DELAY_MS = 15_000
+/**
+ * How often the multi-directory config file is re-statted while the watcher runs.
+ *
+ * `skills-dirs.json` is re-read at the start of every pass — but a pass is up to
+ * six hours apart, so a folder the user just added could sit unnoticed for that
+ * long and the panel would look inert ("I changed the config and nothing
+ * happened"). Something has to notice the change, and one `stat` of one file per
+ * second is cheap enough to be that something. Polling the path also survives how
+ * editors actually save (write a temp file, rename it over the target): a watch
+ * handle on the old inode would go quiet, while the path always holds the new
+ * file.
+ */
+const CONFIG_POLL_MS = 1000
+/**
+ * One save can be several writes, so at most one extra pass per window. A change
+ * inside the window is remembered, not dropped — and `check()` coalesces
+ * concurrent callers anyway.
+ */
+const CONFIG_DEBOUNCE_MS = 700
 /** A hung `git` (auth prompt, dead proxy) must not wedge the watcher. */
 const GIT_TIMEOUT_MS = 25_000
 /** Repos checked at the same time. `ls-remote` is cheap but it is still HTTPS. */
@@ -221,9 +240,89 @@ function skillsDirKey(dir) {
   return CASE_INSENSITIVE_FS ? unified.toLowerCase() : unified
 }
 
+/** `JSON.parse` as data: a broken file is an expected outcome here, not a throw. */
+function tryParseJson(text) {
+  try {
+    return { ok: true, value: JSON.parse(text) }
+  } catch (error) {
+    return { ok: false, error }
+  }
+}
+
+/** The string entries of `parsed.dirs`, or null when there is no dirs array. */
+function configStringDirs(parsed) {
+  const list = Array.isArray(parsed?.dirs) ? parsed.dirs : null
+  return list === null ? null : list.filter(entry => typeof entry === 'string')
+}
+
+/**
+ * A control character inside a configured path: `\u0000`-`\u001f`.
+ *
+ * Such a path is the fingerprint of the hand-written backslash mistake — see
+ * `readSkillsDirsConfig`. A real folder name has no business containing one.
+ */
+const CONTROL_CHAR = /[\u0000-\u001f]/
+
+/**
+ * Repair hand-written Windows paths: every backslash that is not already part of
+ * a valid escape (`\\`, `\"`, `\/`) gets one of its own.
+ *
+ * Scanning character by character — rather than one backslash at a time with a
+ * regex — is what makes the repair safe to apply to a whole file. A regex would
+ * look at the second backslash of a correctly written `"C:\\good"`, see a
+ * backslash followed by `g`, escape it, and turn a valid file into an invalid
+ * one. Consuming a valid pair as a single unit leaves correct escapes untouched
+ * and only touches the bare ones.
+ */
+function escapeBareBackslashes(text) {
+  const source = String(text)
+  let out = ''
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (ch !== '\\') {
+      out += ch
+      continue
+    }
+    const next = source[i + 1]
+    if (next === '\\' || next === '"' || next === '/') {
+      out += ch + next
+      i += 1
+      continue
+    }
+    out += '\\\\'
+  }
+  return out
+}
+
 /**
  * Read `skills-dirs.json`. Never throws: any problem degrades to "no dirs from
  * here" plus one warning string (path-free — this reaches the renderer).
+ *
+ * ── The hand-written backslash ──────────────────────────────────────────────
+ *
+ * Windows paths in JSON are a trap users fall into twice, so the file is read
+ * leniently in exactly one direction, and only when it is provably wrong:
+ *
+ *   1. Strict `JSON.parse` first. When it succeeds and the paths are clean, they
+ *      are used verbatim — no rewriting, no warning.
+ *   2. When it fails, one repair retry: bare backslashes get escaped, then the
+ *      result is parsed strictly again. `"D:\Programs Data\..."` (`\P` is not an
+ *      escape) is the mistake; the old behaviour was to call the whole file
+ *      invalid and skip every configured root, which is indistinguishable from
+ *      "adding a directory did nothing". A successful retry is used and reported
+ *      as a warning, so the user learns the file needs fixing without losing the
+ *      folders in the meantime. A retry that still fails keeps the old behaviour:
+ *      skip this layer, one warning.
+ *   3. A strict parse that *succeeds* can still be the same mistake:
+ *      `"C:\new\table"` is valid JSON (`\n` and `\t` are escapes) and parses into
+ *      a path containing a newline and a tab. A control character in a path is
+ *      therefore treated as the same unescaped-backslash bug: repair and re-parse,
+ *      use the repaired paths with a warning when they come out clean, otherwise
+ *      keep the original value and say so rather than silently using a path no
+ *      filesystem can open.
+ *
+ * Anything else (an unterminated string, a missing comma) stays a broken file: it
+ * is skipped with a warning, exactly as before.
  */
 function readSkillsDirsConfig(file, warnings) {
   let raw
@@ -236,20 +335,48 @@ function readSkillsDirsConfig(file, warnings) {
     }
     return []
   }
-  let parsed
-  try {
-    // Windows tooling (Notepad, PowerShell's `-Encoding utf8`, some editors'
-    // "UTF-8 with BOM") prepends U+FEFF, and `JSON.parse` rejects it. A file the
-    // user hand-edited is exactly where that is most likely, so the BOM is
-    // stripped before parsing instead of being reported as a broken config.
-    parsed = JSON.parse(raw.replace(/^\uFEFF/, ''))
-  } catch {
-    warnings.push(`技能目录配置文件不是合法 JSON（${path.basename(file)}），本层已跳过`)
-    return []
+  // Windows tooling (Notepad, PowerShell's `-Encoding utf8`, some editors'
+  // "UTF-8 with BOM") prepends U+FEFF, and `JSON.parse` rejects it. A file the
+  // user hand-edited is exactly where that is most likely, so the BOM is
+  // stripped before parsing instead of being reported as a broken config.
+  const text = raw.replace(/^\uFEFF/, '')
+  const name = path.basename(file)
+
+  const strict = tryParseJson(text)
+  let parsed = null
+  let repaired = false
+  if (strict.ok) {
+    parsed = strict.value
+    const entries = configStringDirs(parsed)
+    if (entries !== null && entries.some(entry => CONTROL_CHAR.test(entry))) {
+      const fixed = tryParseJson(escapeBareBackslashes(text))
+      const fixedEntries = fixed.ok ? configStringDirs(fixed.value) : null
+      if (fixedEntries !== null && !fixedEntries.some(entry => CONTROL_CHAR.test(entry))) {
+        parsed = fixed.value
+        repaired = true
+      } else {
+        warnings.push(
+          `技能目录配置文件中有路径包含控制字符（${name}），可能是反斜杠未转义，已保留原值，请检查后重写`,
+        )
+      }
+    }
+  } else {
+    const fixed = tryParseJson(escapeBareBackslashes(text))
+    if (fixed.ok) {
+      parsed = fixed.value
+      repaired = true
+    } else {
+      warnings.push(`技能目录配置文件不是合法 JSON（${name}），本层已跳过`)
+      return []
+    }
   }
+  if (repaired) {
+    warnings.push(`技能目录配置文件中的反斜杠未转义，已按 Windows 路径自动修正（${name}）`)
+  }
+
   const list = Array.isArray(parsed?.dirs) ? parsed.dirs : null
   if (!list) {
-    warnings.push(`技能目录配置文件缺少 dirs 数组（${path.basename(file)}），本层已跳过`)
+    warnings.push(`技能目录配置文件缺少 dirs 数组（${name}），本层已跳过`)
     return []
   }
   const dirs = list.filter(entry => typeof entry === 'string' && entry.trim())
@@ -493,26 +620,56 @@ function assignSkillDisplays(repos) {
   })
 }
 
-/** Git sub-branches of a root: the skill folders installed as clones. */
-function listGitRepos(dir) {
+/**
+ * Git repositories directly under one root: the root **itself** when it is a
+ * repository, plus every immediate subdirectory that is one.
+ *
+ * A configured directory is very often a clone in its own right — the user points
+ * at the skill repository they installed, not at a folder full of them — and
+ * looking only at subdirectories made such a root contribute nothing at all. The
+ * folder was configured, and the panel said nothing about it, which reads exactly
+ * like "adding it did nothing". The root is therefore a candidate like any other.
+ *
+ * Depth is still capped at one level (root + its direct children): a configured
+ * folder must never turn into a full disk walk.
+ *
+ * `name` is the folder name to show — the root's own basename for its repository,
+ * the entry name for a subdirectory — and `dir` is the absolute path. The caller
+ * dedups on `dir`, because "root A itself" and "a subdirectory of root B" can be
+ * the same real folder.
+ */
+function listGitRepoEntries(dir) {
+  // Absolute throughout: a candidate's `dir` is what git is spawned in, and the
+  // caller dedups on `skillsDirKey`, which resolves anyway.
+  const root = path.resolve(dir)
   let entries
   try {
-    entries = fs.readdirSync(dir, { withFileTypes: true })
+    entries = fs.readdirSync(root, { withFileTypes: true })
   } catch (error) {
     // A missing root is normal on a fresh install or a dangling config entry.
-    return { names: [], missing: true }
+    return { repos: [], missing: true }
   }
-  const names = entries
+  const repos = []
+  // The root's own repository comes first: it is the one the user named.
+  if (isGitRepo(root)) repos.push({ name: skillsDirBasename(root), dir: root })
+  const children = entries
     .filter(entry => {
       try {
-        return entry.isDirectory() && isGitRepo(path.join(dir, entry.name))
+        return entry.isDirectory() && isGitRepo(path.join(root, entry.name))
       } catch {
         return false
       }
     })
-    .map(entry => entry.name)
-    .sort((a, b) => a.localeCompare(b))
-  return { names, missing: false }
+    .map(entry => ({ name: entry.name, dir: path.join(root, entry.name) }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+  repos.push(...children)
+  return { repos, missing: false }
+}
+
+/** Names-only view of `listGitRepoEntries`, kept for older callers and tests. */
+function listGitRepos(dir) {
+  const { repos, missing } = listGitRepoEntries(dir)
+  return { names: repos.map(repo => repo.name), missing }
 }
 
 function isGitRepo(dir) {
@@ -522,6 +679,54 @@ function isGitRepo(dir) {
   } catch {
     return false
   }
+}
+
+/**
+ * Flatten configured roots into candidate repositories: one entry per real
+ * folder, each already carrying its root index, root basename and absolute path.
+ *
+ * Two roots can reach the same folder (one root *is* a subdirectory of another, or
+ * the config names a folder and its parent). Checking such a path twice would
+ * double its network cost and show the user two rows for one repository, so the
+ * first root in configured order owns it — a stable choice, since the root order
+ * is itself stable. Identity is `skillsDirKey`, i.e. `path.resolve` plus
+ * separator/case normalisation, so Windows spellings of one folder collapse.
+ *
+ * Returns `{ repos, missing, truncated }`: `missing` counts roots that could not
+ * be listed at all, `truncated` says the per-pass cap was hit.
+ */
+function collectSkillRepos(dirs) {
+  const list = Array.isArray(dirs) ? dirs : []
+  const repos = []
+  const seen = new Set()
+  let missing = 0
+  let truncated = false
+  for (let rootIndex = 0; rootIndex < list.length; rootIndex += 1) {
+    const dir = list[rootIndex]
+    const { repos: found, missing: gone } = listGitRepoEntries(dir)
+    if (gone) {
+      missing += 1
+      continue
+    }
+    const root = skillsDirBasename(dir)
+    for (const entry of found) {
+      let key
+      try {
+        key = skillsDirKey(entry.dir)
+      } catch {
+        continue
+      }
+      if (seen.has(key)) continue
+      // The cap is per pass, not per root: the network cost is what it limits.
+      if (repos.length >= MAX_REPOS) {
+        truncated = true
+        break
+      }
+      seen.add(key)
+      repos.push({ name: entry.name, rootIndex, root, dir: entry.dir })
+    }
+  }
+  return { repos, missing, truncated }
 }
 
 const SHA = /^[0-9a-f]{40,64}$/
@@ -633,6 +838,16 @@ async function readLocalStatus(git, dir) {
  * `git status` tells the user in a terminal. It can be stale (nothing here
  * fetches), which is why the UI says "未推送" and never claims a relationship with
  * the live remote — that comparison comes from `ls-remote` separately.
+ *
+ * `dirty` means **tracked** content changed — modified, staged, renamed, deleted
+ * or conflicted. Untracked files are counted, never dirt: git protects them by
+ * itself during a fast-forward (it refuses only when upstream adds a colliding
+ * path), so they neither make an update unusable nor deserve a row of their own.
+ * This is the same rule `skills-apply.cjs` blocks on (see "What 'dirty' means
+ * here" there): the panel must not promise a skip the updater would not make, nor
+ * hide a skip it would. `untrackedOnly` is the derived case that used to be mixed
+ * into `dirty` — a repository whose only local content is untracked files — kept
+ * as an explicit flag so the two can never be confused again.
  */
 function localFlags(local) {
   if (local === null || local === undefined) return null
@@ -642,7 +857,10 @@ function localFlags(local) {
   const ahead = Number.isFinite(local.ahead) ? Number(local.ahead) : null
   const behind = Number.isFinite(local.behind) ? Number(local.behind) : null
   return {
-    dirty: modified + untracked > 0,
+    // Conflicts are counted in `modified` by `parseLocalStatus`, so this covers
+    // them too. Untracked entries deliberately do not.
+    dirty: modified > 0,
+    untrackedOnly: modified === 0 && untracked > 0,
     modified,
     untracked,
     conflicted,
@@ -657,9 +875,17 @@ function localFlags(local) {
 /**
  * Does this repository have anything the user should look at?
  *
- * Remote updates are the original reminder; uncommitted or unpushed work is added
- * because both make a one-click update unusable on that repository (it would be
- * skipped), and silently skipping is worse than saying why up front.
+ * Remote updates are the original reminder; uncommitted **tracked** work and
+ * unpushed commits are added because both make a one-click update unusable on
+ * that repository (it would be skipped), and silently skipping is worse than
+ * saying why up front.
+ *
+ * Untracked files are not a reason for a row: a repository holding nothing but a
+ * generated `output/` (the `picture-skills` case) is updatable, so a row with a
+ * lone "未跟踪 N" chip and no button told the user something was wrong when
+ * nothing was. When such a repository *does* get a row — the remote moved, or it
+ * has unpushed commits — the untracked count is still shown as a chip: there it is
+ * useful context ("this update will leave those files alone").
  */
 function needsAttention(item) {
   if (item?.state === 'update') return true
@@ -833,14 +1059,35 @@ function createSkillsWatcher({
     return { dirs, roots: dirs.map((dir, index) => asRoot(dir, index, 'config')), warnings: [] }
   }
 
+  /**
+   * A number that changes exactly when the set of resolved roots changes.
+   *
+   * The panel has to be able to say "your edit to skills-dirs.json took effect",
+   * and it never sees a path — while basenames are not unique (`D:\a\skills` and
+   * `E:\b\skills` look identical from over there). This counter is the path-free
+   * answer: it is bumped here, in the process that owns the paths, whenever the
+   * resolved root list differs from the previous pass.
+   */
+  let rootsRevision = 0
+  let rootsKey = null
+  const adoptRoots = resolved => {
+    const key = resolved.dirs.map(skillsDirKey).join('|')
+    if (key !== rootsKey) {
+      rootsKey = key
+      rootsRevision += 1
+    }
+    rootList = resolved.roots
+    return resolved
+  }
+
   // A first snapshot needs *some* answer for the UI, so resolve once up front.
-  const initial = resolveRoots()
-  rootList = initial.roots
+  const initial = adoptRoots(resolveRoots())
 
   let snapshot = {
     // First root, for the callers that predate multi-root.
     skillsDir: rootList[0]?.dir || '',
     roots: toPublicRoots(rootList),
+    rootsRevision,
     warnings: initial.warnings,
     checking: false,
     // Until the first pass ends, the UI shows nothing rather than "0 updates",
@@ -859,6 +1106,30 @@ function createSkillsWatcher({
   let loopTimer
   let stopped = false
 
+  /**
+   * The config file whose changes this watcher reacts to. Empty for a pinned
+   * watcher: the caller named the folders, so no file can change what is scanned.
+   */
+  const watchFile = pinned.length ? '' : skillsDirsConfigPath(configDir)
+  /**
+   * "Did the user touch the file?" identity: mtime plus size, so an edit in place
+   * and a rename-over-the-top are both seen. A missing file is a state of its own,
+   * which is what lets the watcher notice the file being *created* later.
+   */
+  const configFingerprint = () => {
+    if (!watchFile) return ''
+    try {
+      const stat = fs.statSync(watchFile)
+      return `${stat.mtimeMs}:${stat.size}`
+    } catch {
+      return 'absent'
+    }
+  }
+  let configTimer
+  let configSeen = ''
+  let configChanged = false
+  let lastConfigCheckAt = 0
+
   const publish = patch => {
     snapshot = { ...snapshot, ...patch }
     try {
@@ -870,34 +1141,16 @@ function createSkillsWatcher({
   }
 
   /**
-   * Every git folder under every configured root, flattened.
+   * Every git folder under every configured root, flattened — root-itself
+   * repositories included, one entry per real path (`collectSkillRepos`).
    * Returns `{ repos, roots, warnings, allMissing }` — `repos` items already
-   * carry their root index and display name.
+   * carry their root index, display name and absolute `dir`.
    */
   const collectRepos = () => {
-    const resolved = resolveRoots()
+    const resolved = adoptRoots(resolveRoots())
     const { dirs, warnings } = resolved
-    rootList = resolved.roots
 
-    const repos = []
-    let missingCount = 0
-    let truncated = false
-    dirs.forEach((dir, index) => {
-      const { names, missing } = listGitRepos(dir)
-      if (missing) {
-        missingCount += 1
-        return
-      }
-      const root = path.basename(dir.replace(/[\\/]+$/, '')) || dir
-      for (const name of names) {
-        // The cap is per pass, not per root: the network cost is what it limits.
-        if (repos.length >= MAX_REPOS) {
-          truncated = true
-          break
-        }
-        repos.push({ name, rootIndex: index, root })
-      }
-    })
+    const { repos, missing: missingCount, truncated } = collectSkillRepos(dirs)
     if (truncated) {
       warnings.push(`技能仓库数量超过 ${MAX_REPOS} 个，其余未检查`)
       log?.warn?.(`[skills] 超过 ${MAX_REPOS} 个候选仓库，其余本轮跳过`)
@@ -907,8 +1160,9 @@ function createSkillsWatcher({
     // names in different roots would both claim the bare name.
     const decorated = assignSkillDisplays(repos)
     return {
-      repos: decorated.map(repo => ({ ...repo, dir: path.join(dirs[repo.rootIndex], repo.name) })),
+      repos: decorated,
       roots: toPublicRoots(rootList),
+      rootsRevision,
       warnings,
       allMissing: dirs.length > 0 && missingCount === dirs.length,
     }
@@ -923,13 +1177,21 @@ function createSkillsWatcher({
         gitResolved = true
       }
       if (git === null) {
+        // Roots are resolved even here: the user may have just edited the config,
+        // and the panel has to show the folders it now holds whether or not git
+        // could be found. Stale rows are cleared with them.
+        const resolved = adoptRoots(resolveRoots())
         publish({
           checking: false,
           checked: true,
+          roots: toPublicRoots(rootList),
+          rootsRevision,
+          warnings: resolved.warnings,
           lastCheckedAt: Date.now(),
           error: '未找到 git，无法检查技能仓库更新',
           items: [],
           updates: [],
+          attention: [],
         })
         return snapshot
       }
@@ -944,6 +1206,7 @@ function createSkillsWatcher({
           checking: false,
           checked: true,
           roots,
+          rootsRevision,
           warnings,
           lastCheckedAt: Date.now(),
           error: allMissing
@@ -952,12 +1215,16 @@ function createSkillsWatcher({
               : `${roots.length} 个技能目录都不存在（${roots.map(r => r.basename).join('、')}）`
             : null,
           items: [],
+          // Empty on purpose: after a config edit removes the last root there is
+          // no repository left to keep a row for, and a stale row would outlive
+          // the folder it names.
           updates: [],
+          attention: [],
         })
         return snapshot
       }
 
-      publish({ checking: true, error: null, roots, warnings })
+      publish({ checking: true, error: null, roots, rootsRevision, warnings })
       log?.debug?.(
         `[skills] 检查 ${repos.length} 个技能仓库（${roots.length} 个目录: ${roots.map(r => r.basename).join(' | ')}）`,
       )
@@ -993,6 +1260,8 @@ function createSkillsWatcher({
       const next = publish({
         checking: false,
         checked: true,
+        roots,
+        rootsRevision,
         items: results,
         updates,
         attention,
@@ -1023,6 +1292,35 @@ function createSkillsWatcher({
     return task
   }
 
+  /**
+   * Notice a change to `skills-dirs.json` and start a pass for it.
+   *
+   * Without this the file was only read when a pass happened, and passes are six
+   * hours apart: the user edited the config, looked at the panel, and saw nothing
+   * — which reads as "adding that folder did nothing". One 1 Hz `stat` closes the
+   * gap within about a second, and because the fingerprint is taken from the
+   * *path*, an editor's atomic replace is seen like any other write. A file that
+   * does not exist yet is remembered as `absent`, so creating it later counts as
+   * a change too.
+   */
+  const pollConfigFile = () => {
+    if (stopped || !watchFile) return
+    const fingerprint = configFingerprint()
+    if (fingerprint !== configSeen) {
+      configSeen = fingerprint
+      configChanged = true
+      log?.debug?.('[skills] skills-dirs.json 有变动，稍后重查')
+    }
+    if (!configChanged) return
+    const now = Date.now()
+    // Debounce, not a drop: a suppressed change stays pending until the window
+    // passes, so a burst of writes still produces exactly one pass.
+    if (now - lastConfigCheckAt < CONFIG_DEBOUNCE_MS) return
+    configChanged = false
+    lastConfigCheckAt = now
+    void check()
+  }
+
   const start = () => {
     if (stopped) return
     firstTimer = setTimeout(() => {
@@ -1032,14 +1330,27 @@ function createSkillsWatcher({
       loopTimer.unref?.()
     }, FIRST_DELAY_MS)
     firstTimer.unref?.()
+    if (watchFile) {
+      // Baseline before the first tick: a file that is already there and has not
+      // changed must not trigger anything, only a change (or a first appearance)
+      // afterwards.
+      configSeen = configFingerprint()
+      configTimer = setInterval(pollConfigFile, CONFIG_POLL_MS)
+      // Never hold the process open: this is a background convenience, not a
+      // reason for Electron to stay alive.
+      configTimer.unref?.()
+    }
   }
 
   const stop = () => {
     stopped = true
     if (firstTimer !== undefined) clearTimeout(firstTimer)
     if (loopTimer !== undefined) clearInterval(loopTimer)
+    if (configTimer !== undefined) clearInterval(configTimer)
     firstTimer = undefined
     loopTimer = undefined
+    configTimer = undefined
+    configChanged = false
   }
 
   return {
@@ -1060,7 +1371,7 @@ function createSkillsWatcher({
       return rootList[0]?.dir || ''
     },
     /** Absolute path of the multi-dir config file, for logs only. */
-    configFile: pinned.length ? '' : skillsDirsConfigPath(configDir),
+    configFile: watchFile,
     stateFile: stateDir ? path.join(stateDir, '.dsh-credit-float-skills.json') : '',
   }
 }
@@ -1159,6 +1470,8 @@ module.exports = {
   assignSkillDisplays,
   skillKey,
   listGitRepos,
+  listGitRepoEntries,
+  collectSkillRepos,
   SKILLS_DIRS_CONFIG,
   // exported for tests
   checkRepo,
@@ -1169,4 +1482,5 @@ module.exports = {
   readLocalStatus,
   resolveUpstreamRef,
   runGit,
+  escapeBareBackslashes,
 }

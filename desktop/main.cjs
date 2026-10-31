@@ -817,6 +817,12 @@ let refreshRequestedAt = 0
 ipcMain.on('dcf:refresh', () => {
   refreshRequestedAt = Date.now()
   onRefreshRequested(refreshRequestedAt)
+  // The same click also re-checks the skill repositories. The credit numbers and
+  // the skill status are the two things this window reports, and "刷新" is the
+  // only button the user has for "show me the current truth" — leaving the skill
+  // half waiting for the six-hour timer is how a just-edited config looks ignored.
+  // `check()` coalesces with any pass already running, and never throws.
+  void skillsWatcher.check()
 })
 
 ipcMain.on('dcf:close', () => {
@@ -894,7 +900,10 @@ function publicSkills(snapshot) {
     short: (item.remoteSha ?? '').slice(0, 7),
     local: item.flags
       ? {
+          // `dirty` is tracked-only dirt — exactly what blocks an update (see
+          // skills-apply.cjs). Untracked files are counted, never dirt.
           dirty: item.flags.dirty === true,
+          untrackedOnly: item.flags.untrackedOnly === true,
           modified: item.flags.modified ?? 0,
           untracked: item.flags.untracked ?? 0,
           conflicted: item.flags.conflicted ?? 0,
@@ -917,6 +926,10 @@ function publicSkills(snapshot) {
     // folders are watched is file configuration (skills-dirs.json /
     // DCF_SKILLS_DIRS, see README) — the panel only groups what it is told.
     roots: roots.map(root => ({ index: root.index, basename: root.basename })),
+    // Bumped whenever the resolved set of configured folders changes (never a
+    // path): the panel needs it to tell "your edit to skills-dirs.json took
+    // effect" from "nothing changed", which it cannot do from basenames.
+    rootsRevision: Number.isFinite(snapshot.rootsRevision) ? snapshot.rootsRevision : 0,
     // Remote updates: what 「全部更新」 acts on.
     updates: updates.map(publicItem),
     // Everything worth a row: updates plus repositories with uncommitted or
@@ -929,6 +942,12 @@ function publicSkills(snapshot) {
       attention: attention.length,
       unpushed: items.filter(i => i.flags?.unpushed === true).length,
       dirty: items.filter(i => i.flags?.dirty === true).length,
+      // Untracked content is still reported honestly even though it no longer
+      // earns a row of its own: `untracked` counts repositories, `untrackedFiles`
+      // sums the files. "The panel shows nothing for this repository" stays a
+      // deliberate answer instead of becoming a blind spot.
+      untracked: items.filter(i => (Number(i.flags?.untracked) || 0) > 0).length,
+      untrackedFiles: items.reduce((sum, i) => sum + (Number(i.flags?.untracked) || 0), 0),
       upToDate: items.filter(i => i.state === 'up-to-date').length,
       unreachable: items.filter(i => i.state === 'unreachable').length,
       diverged: items.filter(i => i.state === 'diverged').length,
